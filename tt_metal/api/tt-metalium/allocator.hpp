@@ -109,6 +109,9 @@ public:
 
     void clear();
 
+    // Set device ID for allocation tracking
+    void set_device_id(int device_id) { device_id_ = device_id; }
+
 protected:
     // Initializers for mapping banks to DRAM channels / L1 banks
     void init_one_bank_per_channel();
@@ -140,6 +143,9 @@ private:
     //
     // TODO(river): revert this to inplace storage if we can shove Allocator into impl.
     std::unique_ptr<AllocatorConfig> config_;
+
+    // Device ID for allocation tracking (set via set_device_id)
+    int device_id_ = -1;
 };
 
 namespace detail {
