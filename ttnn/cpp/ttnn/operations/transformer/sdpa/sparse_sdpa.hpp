@@ -73,4 +73,23 @@ ttnn::Tensor sparse_sdpa(
     bool block_cyclic_cache_tp_sharded = false,
     const std::optional<ttnn::Tensor>& attention_sink = std::nullopt);
 
+// sparse_sdpa with the split-K statistics (SparseSDPAParams::emit_stats): returns [out, stats], stats [1, 1, S, 2 H]
+// fp32 ROW_MAJOR = per token [m_0 .. m_H-1, l_0 .. l_H-1] (m = the unscaled score max of the keys attended, l = sum
+// exp((s - m) scale)); same arguments as sparse_sdpa. The owner of a head merges C devices' partials with
+// M = max_c m_c, w_c = exp((m_c - M) scale) l_c / sum_c' exp((m_c' - M) scale) l_c', o = sum_c w_c o_c.
+std::vector<ttnn::Tensor> sparse_sdpa_stats(
+    const ttnn::Tensor& q,
+    const ttnn::Tensor& kv,
+    const ttnn::Tensor& indices,
+    uint32_t v_dim,
+    SparseKVFormat kv_format,
+    std::optional<float> scale = std::nullopt,
+    uint32_t k_chunk_size = 128,
+    std::optional<ttnn::DeviceComputeKernelConfig> compute_kernel_config = std::nullopt,
+    std::optional<uint32_t> cache_batch_idx = std::nullopt,
+    std::optional<uint32_t> block_cyclic_sp_axis = std::nullopt,
+    std::optional<uint32_t> block_cyclic_chunk_local = std::nullopt,
+    bool block_cyclic_cache_tp_sharded = false,
+    const std::optional<ttnn::Tensor>& attention_sink = std::nullopt);
+
 }  // namespace ttnn::transformer

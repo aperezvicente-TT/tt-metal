@@ -3,8 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
+import atexit
+import concurrent.futures
+import fcntl
 import os
 import pathlib
+import re
+import stat
+import threading
 import uuid
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
@@ -18,6 +24,205 @@ from ttnn.operations.golden_common import golden_to_output_dtype
 def _validate_file_extension(file_name: pathlib.Path):
     if not str(file_name).endswith(".tensorbin"):
         raise RuntimeError(f"File {file_name} must have .tensorbin extension")
+
+
+_CANONICAL_PROC_SELF_FD = re.compile(r"/proc/self/fd/([1-9][0-9]*)\Z")
+_PROC_SELF_FD_PREFIX = "/proc/self/fd/"
+_PROC_FD_MAGIC_PATH = re.compile(r"\A/proc/(?:self|thread-self|[0-9]+)(?:/task/(?:self|[0-9]+))?/fd(?:/|\Z)")
+_MAX_LOAD_TENSOR_SYMLINK_HOPS = 40
+_MAX_LOAD_TENSOR_PATH_STEPS = 4096
+_TENSORBIN_HEADER_PREFIX_BYTES = 8
+_TENSORBIN_HEADER_ALIGNMENT = 8
+_MAX_TENSORBIN_HEADER_BYTES = 16 << 20
+_TILE_BYTES = {
+    ttnn.bfloat16: 2048,
+    ttnn.float32: 4096,
+    ttnn.bfloat8_b: 1088,
+    ttnn.bfloat4_b: 576,
+    ttnn.uint32: 4096,
+    ttnn.int32: 4096,
+    ttnn.uint16: 2048,
+    ttnn.uint8: 1024,
+}
+_ELEMENT_BYTES = {
+    ttnn.bfloat16: 2,
+    ttnn.float32: 4,
+    ttnn.uint32: 4,
+    ttnn.int32: 4,
+    ttnn.uint16: 2,
+    ttnn.uint8: 1,
+}
+
+
+class _LoadTensorCleanupError(RuntimeError):
+    """A tensor load failed after the native read and the returned tensor could not be deallocated."""
+
+    def __init__(self, primary_error: BaseException, cleanup_error: BaseException) -> None:
+        super().__init__(
+            "tensor load failed and returned-tensor cleanup also failed; "
+            f"primary={type(primary_error).__name__}: {primary_error}; "
+            f"cleanup={type(cleanup_error).__name__}: {cleanup_error}"
+        )
+        self.primary_error = primary_error
+        self.cleanup_error = cleanup_error
+
+
+def _file_signature(metadata: os.stat_result) -> Tuple[int, int, int, int, int, int]:
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_mode),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_ctime_ns),
+    )
+
+
+def _stable_descriptor_contract(descriptor: int):
+    proc_path = f"{_PROC_SELF_FD_PREFIX}{descriptor}"
+    try:
+        metadata = os.fstat(descriptor)
+        target = os.readlink(proc_path)
+    except OSError as error:
+        raise RuntimeError(f"File {proc_path} does not name an open descriptor") from error
+    if not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError(f"File {proc_path} descriptor target must be a regular file")
+    if not os.path.isabs(target) or target.endswith(" (deleted)"):
+        raise RuntimeError(f"File {proc_path} descriptor target must be one live absolute file")
+    return _file_signature(metadata), target
+
+
+def _proc_self_fd_contract(file_name: str):
+    """(descriptor, signature, target) for the canonical ``/proc/self/fd/<positive-int>`` spelling, None for any path
+    outside ``/proc/self/fd/``; every other spelling under that prefix is refused."""
+    match = _CANONICAL_PROC_SELF_FD.fullmatch(file_name)
+    if match is None:
+        if file_name.startswith(_PROC_SELF_FD_PREFIX):
+            raise RuntimeError(f"File {file_name} must use the canonical /proc/self/fd/<positive-int> descriptor path")
+        return None
+    descriptor = int(match.group(1))
+    signature, target = _stable_descriptor_contract(descriptor)
+    if not target.endswith(".tensorbin"):
+        raise RuntimeError(f"File {file_name} descriptor target must be an absolute .tensorbin file")
+    return descriptor, signature, target
+
+
+def _reject_proc_fd_alias(file_name: pathlib.Path) -> None:
+    """Resolve every symlink component (bounded) and refuse a path that reaches a /proc/<pid>/fd magic link."""
+    absolute = os.path.abspath(os.fspath(file_name))
+    if _PROC_FD_MAGIC_PATH.match(absolute) is not None:
+        raise RuntimeError(f"File {file_name} must not alias a /proc/self/fd descriptor")
+    pending = list(pathlib.PurePath(absolute).parts[1:])
+    resolved = os.path.sep
+    symlink_hops = 0
+    path_steps = 0
+    while pending:
+        path_steps += 1
+        if path_steps > _MAX_LOAD_TENSOR_PATH_STEPS:
+            raise RuntimeError(f"File {file_name} symlink resolution exceeds its path-step bound")
+        component = pending.pop(0)
+        if component in {"", "."}:
+            continue
+        if component == "..":
+            resolved = os.path.dirname(resolved.rstrip(os.path.sep)) or os.path.sep
+            continue
+        candidate = os.path.join(resolved, component)
+        if _PROC_FD_MAGIC_PATH.match(candidate) is not None:
+            raise RuntimeError(f"File {file_name} must not alias a /proc/self/fd descriptor")
+        try:
+            metadata = os.lstat(candidate)
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise RuntimeError(f"File {file_name} symlink chain is unavailable") from error
+        if not stat.S_ISLNK(metadata.st_mode):
+            resolved = candidate
+            continue
+        symlink_hops += 1
+        if symlink_hops > _MAX_LOAD_TENSOR_SYMLINK_HOPS:
+            raise RuntimeError(f"File {file_name} symlink resolution exceeds its hop bound")
+        try:
+            target = os.readlink(candidate)
+        except OSError as error:
+            raise RuntimeError(f"File {file_name} symlink changed during resolution") from error
+        expanded = os.path.normpath(target if os.path.isabs(target) else os.path.join(resolved, target))
+        if _PROC_FD_MAGIC_PATH.match(expanded) is not None:
+            raise RuntimeError(f"File {file_name} must not alias a /proc/self/fd descriptor")
+        pending = list(pathlib.PurePath(expanded).parts[1:]) + pending
+        resolved = os.path.sep
+
+
+def _expected_tensor_contract(shape, dtype, layout):
+    """Exact-type check of the caller's expectations; the payload byte count of one 32x32-tiled (or row-major) host
+    buffer when shape, dtype and layout are all given, else None."""
+    if shape is not None:
+        if not isinstance(shape, (tuple, list)) or any(type(d) is not int or d <= 0 for d in shape) or not shape:
+            raise RuntimeError(f"expected_shape must be a non-empty tuple of positive ints, got {shape!r}")
+        shape = tuple(shape)
+    if dtype is not None and not isinstance(dtype, ttnn.DataType):
+        raise RuntimeError(f"expected_dtype must be a ttnn.DataType, got {dtype!r}")
+    if layout is not None and not isinstance(layout, ttnn.Layout):
+        raise RuntimeError(f"expected_layout must be a ttnn.Layout, got {layout!r}")
+    if shape is None or dtype is None or layout is None:
+        return shape, None
+    if layout == ttnn.TILE_LAYOUT:
+        if dtype not in _TILE_BYTES:
+            raise RuntimeError(f"payload binding does not cover {dtype} tiles")
+        rows = shape[-2] if len(shape) > 1 else 1
+        batch = math.prod(shape[:-2]) if len(shape) > 2 else 1
+        tiles = batch * math.ceil(rows / 32) * math.ceil(shape[-1] / 32)
+        return shape, tiles * _TILE_BYTES[dtype]
+    if layout == ttnn.ROW_MAJOR_LAYOUT:
+        if dtype not in _ELEMENT_BYTES:
+            raise RuntimeError(f"payload binding does not cover row-major {dtype}")
+        return shape, math.prod(shape) * _ELEMENT_BYTES[dtype]
+    raise RuntimeError(f"payload binding does not cover {layout}")
+
+
+def _pread_exact(descriptor: int, size: int, offset: int) -> bytes:
+    payload = bytearray()
+    while len(payload) < size:
+        try:
+            block = os.pread(descriptor, size - len(payload), offset + len(payload))
+        except InterruptedError:
+            continue
+        except OSError as error:
+            raise RuntimeError("tensorbin header read failed") from error
+        if not block:
+            break
+        payload.extend(block)
+    if len(payload) != size:
+        raise RuntimeError(f"tensorbin is truncated before its {size}-byte header prefix: got {len(payload)} bytes")
+    return bytes(payload)
+
+
+def _bind_tensorbin_payload(descriptor: int, signature, expected_payload_bytes: int, caller_name) -> None:
+    """The file behind ``descriptor`` has a well-formed header prefix and exactly ``expected_payload_bytes`` of data."""
+    file_size = signature[3]
+    header_size = int.from_bytes(_pread_exact(descriptor, _TENSORBIN_HEADER_PREFIX_BYTES, 0), "little", signed=False)
+    if (
+        header_size == 0
+        or header_size > _MAX_TENSORBIN_HEADER_BYTES
+        or header_size % _TENSORBIN_HEADER_ALIGNMENT
+        or _TENSORBIN_HEADER_PREFIX_BYTES + header_size > file_size
+    ):
+        raise RuntimeError(f"File {caller_name} header size {header_size} is invalid for a {file_size}-byte tensorbin")
+    payload_bytes = file_size - _TENSORBIN_HEADER_PREFIX_BYTES - header_size
+    if payload_bytes != expected_payload_bytes:
+        raise RuntimeError(
+            f"File {caller_name} payload is {payload_bytes} bytes, the expected tensor needs {expected_payload_bytes}"
+        )
+    if _file_signature(os.fstat(descriptor)) != signature:
+        raise RuntimeError(f"File {caller_name} changed during header validation")
+
+
+def _validate_loaded_tensor(tensor, expected_shape, expected_dtype, expected_layout, caller_name) -> None:
+    if expected_shape is not None and tuple(int(d) for d in tensor.shape) != expected_shape:
+        raise RuntimeError(f"File {caller_name} holds shape {tuple(tensor.shape)}, expected {expected_shape}")
+    if expected_dtype is not None and tensor.dtype != expected_dtype:
+        raise RuntimeError(f"File {caller_name} holds dtype {tensor.dtype}, expected {expected_dtype}")
+    if expected_layout is not None and tensor.layout != expected_layout:
+        raise RuntimeError(f"File {caller_name} holds layout {tensor.layout}, expected {expected_layout}")
 
 
 def _golden_function(input_tensor: ttnn.Tensor, slices):
@@ -419,6 +624,59 @@ def _golden_function(tensor, dtype=None, *, torch_rank=None, **kwargs):
     return tensor.to(dtype) if dtype is not None else tensor
 
 
+# Weight-cache files are written by a small thread pool so a cold build keeps converting and uploading the next
+# weights while earlier ones are flushed (a single synchronous dump runs at ~1 GB/s and was ~25% of a cold Llama-8B
+# build). Each file is written under a name unique to this fill and renamed when complete, so a concurrent reader never
+# sees a partial file and a failed dump leaves nothing behind. DISTRIBUTED_GATHER dumps are a world collective, so with
+# more than one rank they stay synchronous to keep every rank's collectives in program order.
+# TTNN_SYNC_CACHE_DUMP=1 makes every write synchronous.
+_cache_dump_pool = None
+_cache_dump_futures = []
+_cache_dump_lock = threading.Lock()
+
+
+def _single_rank():
+    return not ttnn.distributed_context_is_initialized() or int(ttnn.distributed_context_get_size()) == 1
+
+
+def _dump_cache_file(cache_file_name, tensor, cache_dump_mode):
+    def job():
+        tmp_file_name = f"{cache_file_name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        try:
+            ttnn._ttnn.tensor.dump_tensor_flatbuffer(tmp_file_name, tensor, cache_dump_mode)
+            if pathlib.Path(tmp_file_name).exists():  # DISTRIBUTED_GATHER: only rank 0 writes
+                os.replace(tmp_file_name, cache_file_name)
+        except BaseException:
+            pathlib.Path(tmp_file_name).unlink(missing_ok=True)
+            raise
+
+    if os.environ.get("TTNN_SYNC_CACHE_DUMP", "0") == "1" or (
+        cache_dump_mode != ttnn.DumpTensorMode.LOCAL and not _single_rank()
+    ):
+        job()
+        return
+    global _cache_dump_pool
+    with _cache_dump_lock:
+        if _cache_dump_pool is None:
+            _cache_dump_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=4, thread_name_prefix="ttnn-cache-dump"
+            )
+            atexit.register(wait_for_cache_dumps)
+        _cache_dump_futures.append(_cache_dump_pool.submit(job))
+
+
+def wait_for_cache_dumps():
+    """Block until every weight-cache file queued by as_tensor has been written (re-raises the first write error)."""
+    with _cache_dump_lock:
+        pending = list(_cache_dump_futures)
+        _cache_dump_futures.clear()
+    for future in pending:
+        future.result()
+
+
+ttnn.wait_for_cache_dumps = wait_for_cache_dumps
+
+
 @ttnn.register_python_operation(name="ttnn.to_torch", golden_function=_golden_function)
 def to_torch(
     tensor: ttnn.Tensor,
@@ -753,28 +1011,138 @@ def _golden_function_load_tensor(file_name, *, device=None, **_):
     return host_tensor.to_torch()
 
 
+def _load_tensor_from_owned_descriptor(
+    descriptor: int,
+    *,
+    signature,
+    target: str,
+    device,
+    caller_name,
+    expected,
+    post_validate: Optional[Callable[[], None]] = None,
+) -> ttnn.Tensor:
+    """Native read through ``/proc/self/fd/<descriptor>`` of a descriptor this call owns; the descriptor's identity is
+    checked before and after the read, and a tensor that fails a check is deallocated before the error propagates."""
+    expected_shape, expected_dtype, expected_layout, expected_payload_bytes = expected
+    if _stable_descriptor_contract(descriptor) != (signature, target):
+        raise RuntimeError(f"File {caller_name} descriptor identity changed before tensor load")
+    if expected_payload_bytes is not None:
+        _bind_tensorbin_payload(descriptor, signature, expected_payload_bytes, caller_name)
+    tensor = ttnn._ttnn.tensor.load_tensor_flatbuffer(f"{_PROC_SELF_FD_PREFIX}{descriptor}", device)
+    try:
+        try:
+            after = _stable_descriptor_contract(descriptor)
+        except RuntimeError as error:
+            raise RuntimeError(f"File {caller_name} descriptor target changed during tensor load") from error
+        if after != (signature, target):
+            raise RuntimeError(f"File {caller_name} descriptor target changed during tensor load")
+        _validate_loaded_tensor(tensor, expected_shape, expected_dtype, expected_layout, caller_name)
+        if post_validate is not None:
+            post_validate()
+        return tensor
+    except BaseException as error:
+        try:
+            ttnn.deallocate(tensor)
+        except BaseException as cleanup_error:
+            raise _LoadTensorCleanupError(error, cleanup_error) from error
+        raise
+
+
 @ttnn.register_python_operation(name="ttnn.load_tensor", golden_function=_golden_function_load_tensor)
-def load_tensor(file_name: Union[str, pathlib.Path], *, device: ttnn.MeshDevice = None) -> ttnn.Tensor:
+def load_tensor(
+    file_name: Union[str, pathlib.Path],
+    *,
+    device: ttnn.MeshDevice = None,
+    expected_shape: Optional[Tuple[int, ...]] = None,
+    expected_dtype: Optional[ttnn.DataType] = None,
+    expected_layout: Optional[ttnn.Layout] = None,
+) -> ttnn.Tensor:
     """
     Load tensor from a file.
+
+    ``file_name`` is a ``.tensorbin`` path, or ``/proc/self/fd/<n>`` for a descriptor the caller holds open on a
+    ``.tensorbin`` file: the load then reads the file the descriptor is bound to, not whatever the path names now.
+    Any other spelling under ``/proc/self/fd/`` and any path whose symlinks reach a ``/proc/<pid>/fd`` entry is
+    refused. Every load goes through a descriptor this call owns and fails if the file changes during the load.
 
     Args:
         file_name (str | pathlib.Path): the file name.
 
     Keyword Args:
         device (ttnn.MeshDevice, optional): the device. Defaults to `None`.
+        expected_shape (tuple[int, ...], optional): the logical shape the file must hold.
+        expected_dtype (ttnn.DataType, optional): the dtype the file must hold.
+        expected_layout (ttnn.Layout, optional): the layout the file must hold. With all three expectations given
+            the file's data region must also be exactly the size of that one host tensor (32x32 tiles or row-major),
+            checked before the read.
+
+    A load that fails an expectation or an identity check raises ``RuntimeError`` and deallocates the tensor it read.
 
     Returns:
         ttnn.Tensor: the loaded tensor.
     """
-    file_name = pathlib.Path(file_name)
+    raw_file_name = os.fspath(file_name)
+    if not isinstance(raw_file_name, str):
+        raise RuntimeError(f"File {file_name!r} must be a str or os.PathLike[str] path")
+    if device is not None and not isinstance(device, ttnn.MeshDevice):
+        raise RuntimeError(f"device must be a ttnn.MeshDevice, got {type(device).__name__}")
+    shape, payload_bytes = _expected_tensor_contract(expected_shape, expected_dtype, expected_layout)
+    expected = (shape, expected_dtype, expected_layout, payload_bytes)
+
+    descriptor_contract = _proc_self_fd_contract(raw_file_name)
+    if descriptor_contract is not None:
+        descriptor, signature, target = descriptor_contract
+        try:
+            owned = fcntl.fcntl(descriptor, fcntl.F_DUPFD_CLOEXEC, 3)
+        except OSError as error:
+            raise RuntimeError(f"File {raw_file_name} does not name an open descriptor") from error
+        try:
+            return _load_tensor_from_owned_descriptor(
+                owned, signature=signature, target=target, device=device, caller_name=raw_file_name, expected=expected
+            )
+        finally:
+            os.close(owned)
+
+    file_name = pathlib.Path(raw_file_name)
+    absolute_path = pathlib.Path(os.path.abspath(raw_file_name))
+    _reject_proc_fd_alias(absolute_path)
     _validate_file_extension(file_name)
     if not file_name.exists():
         raise RuntimeError(f"Unable to load the tensor from {file_name}.  The file does not exist.")
     if not file_name.is_file():
         raise RuntimeError(f"Unable to load the tensor from {file_name}.  The file is not a file.")
+    try:
+        owned = os.open(absolute_path, os.O_RDONLY | os.O_CLOEXEC)
+    except OSError as error:
+        raise RuntimeError(f"Unable to open the tensor from {file_name}.") from error
+    try:
+        if owned < 3:
+            low = owned
+            owned = fcntl.fcntl(low, fcntl.F_DUPFD_CLOEXEC, 3)
+            os.close(low)
+        signature, target = _stable_descriptor_contract(owned)
 
-    return ttnn._ttnn.tensor.load_tensor_flatbuffer(str(file_name), device)
+        def path_still_names_descriptor() -> None:
+            _reject_proc_fd_alias(absolute_path)
+            try:
+                path_signature = _file_signature(os.stat(absolute_path))
+            except OSError as error:
+                raise RuntimeError(f"File {file_name} changed during tensor load") from error
+            if path_signature != signature:
+                raise RuntimeError(f"File {file_name} changed during tensor load")
+
+        path_still_names_descriptor()
+        return _load_tensor_from_owned_descriptor(
+            owned,
+            signature=signature,
+            target=target,
+            device=device,
+            caller_name=file_name,
+            expected=expected,
+            post_validate=path_still_names_descriptor,
+        )
+    finally:
+        os.close(owned)
 
 
 # dump_tensor writes to disk and returns None; there is no output value to compare.
@@ -906,18 +1274,7 @@ def as_tensor(
             f"Generating cache for {cache_file_name} of shape {tensor.shape}, dtype {dtype_name}, layout {layout_name}"
         )
         pathlib.Path(cache_file_name).parent.mkdir(parents=True, exist_ok=True)
-        if cache_dump_mode == ttnn.DumpTensorMode.LOCAL:
-            # Every rank writes its own file here. Publish it with a rename from a temp file unique to this fill, so a
-            # concurrent reader or filler never sees a partial file, and a failed dump leaves nothing behind.
-            tmp_file_name = f"{cache_file_name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-            try:
-                ttnn._ttnn.tensor.dump_tensor_flatbuffer(tmp_file_name, tensor, cache_dump_mode)
-                os.replace(tmp_file_name, cache_file_name)
-            except BaseException:
-                pathlib.Path(tmp_file_name).unlink(missing_ok=True)
-                raise
-        else:
-            ttnn._ttnn.tensor.dump_tensor_flatbuffer(cache_file_name, tensor, cache_dump_mode)
+        _dump_cache_file(cache_file_name, tensor, cache_dump_mode)
         if device is not None:
             tensor = tensor.to(device, memory_config)
         return tensor

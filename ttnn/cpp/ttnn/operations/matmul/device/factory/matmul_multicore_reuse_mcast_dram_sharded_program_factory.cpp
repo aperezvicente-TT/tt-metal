@@ -81,6 +81,7 @@ static ttnn::device_operation::ProgramArtifacts create_program_dram_sharded_spec
     uint32_t per_core_M,
     uint32_t per_core_N_storage,
     uint32_t workers_per_bank,
+    operations::matmul::DramReaderPlacement dram_reader_placement,
     std::optional<UnaryWithParam> fused_activation,
     const tt::tt_metal::MeshTensor& in0_tensor,
     const tt::tt_metal::MeshTensor& in1_tensor,
@@ -168,8 +169,8 @@ static ttnn::device_operation::ProgramArtifacts create_program_dram_sharded_spec
                 {CoreCoord{bank % compute_with_storage_grid_size.x, bank / compute_with_storage_grid_size.x}, bank, 0});
         }
     } else {
-        reader_assignments =
-            get_dram_bank_reader_assignments(device, in1_noc, workers_per_bank, input_all_storage_cores);
+        reader_assignments = get_dram_bank_reader_assignments(
+            device, in1_noc, workers_per_bank, input_all_storage_cores, dram_reader_placement);
     }
     uint32_t num_dram_banks = reader_assignments.size() / workers_per_bank;
 
@@ -1389,6 +1390,7 @@ MatmulMultiCoreReuseMultiCastDRAMShardedProgramFactory::create_program_artifacts
         per_core_M,
         per_core_N,
         workers_per_bank,
+        program_config.dram_reader_placement,
         fused_activation,
         a_mesh,
         b,

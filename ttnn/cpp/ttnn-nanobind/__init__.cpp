@@ -14,6 +14,7 @@
 #include "ttnn-nanobind/device.hpp"
 #include "ttnn-nanobind/events.hpp"
 #include "ttnn-nanobind/fabric.hpp"
+#include "ttnn-nanobind/pcie_p2p.hpp"
 #include "ttnn-nanobind/disaggregation.hpp"
 #include "ttnn-nanobind/layer_completion.hpp"
 #include "ttnn-nanobind/global_circular_buffer.hpp"
@@ -23,6 +24,8 @@
 #include "ttnn-nanobind/d2d_stream_service.hpp"
 #include "ttnn-nanobind/counter_channel.hpp"
 #include "ttnn-nanobind/h2d_stream_service.hpp"
+#include "ttnn-nanobind/dram_image.hpp"
+#include "ttnn-nanobind/fast_bfp.hpp"
 #include "ttnn-nanobind/d2h_stream_service.hpp"
 #include "ttnn-nanobind/layer_ack_service.hpp"
 #include "ttnn-nanobind/mesh_socket.hpp"
@@ -255,6 +258,8 @@ NB_MODULE(_ttnn, mod) {
     auto m_global_semaphore = mod.def_submodule("global_semaphore", "ttnn global semaphore");
     auto m_prefetcher_pipe = mod.def_submodule("prefetcher_pipe", "ttnn prefetcher pipe (experimental)");
     auto m_hd_socket = mod.def_submodule("hd_socket", "ttnn host-device sockets");
+    auto m_dram_image = mod.def_submodule("dram_image", "prototype DRAM-image weight loading");
+    auto m_fast_bfp = mod.def_submodule("fast_bfp", "fast host bf16 -> bfp8/bfp4 tile packing");
     auto m_h2d_stream_service =
         mod.def_submodule("h2d_stream_service", "ttnn persistent host-to-device streaming service");
     auto m_d2h_stream_service =
@@ -270,6 +275,7 @@ NB_MODULE(_ttnn, mod) {
     auto m_reports = mod.def_submodule("reports", "ttnn reports");
     auto m_operations = mod.def_submodule("operations", "ttnn Operations");
     auto m_fabric = mod.def_submodule("fabric", "Fabric instantiation APIs");
+    auto m_pcie_p2p = mod.def_submodule("pcie_p2p", "Blackhole chip-to-chip PCIe peer-to-peer windows");
     auto m_program_descriptors = mod.def_submodule("program_descriptor", "Program descriptors types");
     auto m_tensor_accessor_args = mod.def_submodule("tensor_accessor_args", "Tensor accessor args types");
     auto m_mcast_host =
@@ -286,6 +292,7 @@ NB_MODULE(_ttnn, mod) {
     ttnn::core::py_module_types(m_core);
     ttnn::device::py_device_module_types(m_device);
     ttnn::fabric::bind_fabric_api(m_fabric);
+    ttnn::pcie_p2p::bind_pcie_p2p_api(m_pcie_p2p);
     ttnn::distributed::py_module_types(m_multi_device);
     ttnn::events::py_module_types(m_events);
     ttnn::global_circular_buffer::py_module_types(m_global_circular_buffer);
@@ -338,6 +345,8 @@ NB_MODULE(_ttnn, mod) {
     ttnn::prefetcher_pipe::py_module(m_prefetcher_pipe);
     ttnn::hd_socket::py_module(m_hd_socket);
     ttnn::h2d_stream_service::py_module(m_h2d_stream_service);
+    ttnn::dram_image::py_module(m_dram_image);
+    ttnn::fast_bfp::py_module(m_fast_bfp);
     ttnn::d2h_stream_service::py_module(m_d2h_stream_service);
     ttnn::d2d_stream_service::py_module(m_d2d_stream_service);
     ttnn::counter_channel::py_module(m_counter_channel);

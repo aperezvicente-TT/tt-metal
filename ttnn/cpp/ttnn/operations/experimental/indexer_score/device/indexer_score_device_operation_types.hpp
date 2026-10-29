@@ -25,6 +25,18 @@ struct IndexerScoreProgramConfig {
     std::size_t q_chunk_size = 32;
     std::size_t k_chunk_size = 32;
     std::size_t head_group_size = 1;  // heads resident at once; 1 always fits L1, raise for perf (0 = all)
+    // EXACT head reduction at any head_group_size: the matmul phase runs every resident head back to back
+    // (one head per DEST pass, one matmul mode set per unit) and the gate phase reduces them one head at a time
+    // with the DEFAULT config's MAC + L1-accumulate pack (one mul mode set per unit) -- the per-head instruction
+    // sequence of the streaming default (head_group_size 1), so the score is bitwise the default's while q / w
+    // stay resident across the k bands instead of being re-read per (k tile, head). Classic factory only; the
+    // factory forces qk_subblock_h = qk_batch_heads = qk_col_batch = 1 and sizes cb_qk to the resident group.
+    bool serial_head_reduce = false;
+    // serial_head_reduce only: heads per DEST pass of the MATMUL phase (1 = the default's one-head passes, proven
+    // bitwise; 8 = eight independent per-head tile matmuls per tile_regs round trip -- the same per-tile FPU
+    // sequence, fewer TRISC handshakes; the gate phase stays one head per pass either way). Must divide the
+    // resident head group and fit the half-sync DEST (<= 8).
+    std::size_t serial_pass_heads = 1;
 };
 
 // Resolve head_group_size to a concrete head count (0 = all Hi). Single-sourced so validate and the

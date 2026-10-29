@@ -38,4 +38,24 @@ inline constexpr CoreSchedule for_core(
     }
     return {row, col, block, row % group_rows, start, count};
 }
+
+// KV-BALANCED split (stage 3 M1, 2026-10-24). On the classic metadata path the causal extent kv_len is derived on
+// device, but the static split above deals the units of the whole window, so the columns whose bands lie past kv_len
+// idle (at the 1M key and chunk start 524,288, 6 of 11 columns had work). Deal only the units the extent covers,
+// clamped to >= one band per (block, column) cell (the resident q / w row rendezvous runs at each core's band 0) and
+// <= the window's units. Bands past kv_len stay unassigned (unwritten, as with the static split). Every cell's math is
+// unchanged, so the score plane is bitwise the static split's.
+inline constexpr CoreSchedule for_core_kv(
+    uint32_t core_id,
+    uint32_t group_rows,
+    indexer_ring_schedule::Geometry geometry,
+    uint32_t kv_len_tiles,
+    uint32_t k_tiles_per_unit) {
+    const uint32_t kv_units = (kv_len_tiles + k_tiles_per_unit - 1) / k_tiles_per_unit;
+    const uint32_t cells = geometry.num_blocks * geometry.cols;
+    uint32_t units = kv_units < geometry.units_per_shard ? kv_units : geometry.units_per_shard;
+    units = units > cells ? units : cells;
+    geometry.units_per_shard = units;
+    return for_core<false>(core_id, group_rows, geometry);
+}
 }  // namespace indexer_schedule

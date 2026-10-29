@@ -633,6 +633,10 @@ class ModelArgs:
         self.dram_grid_size = mesh_device.dram_grid_size() if mesh_device else None  # CoreCoord with (x, y)
         self.prefetcher = prefetcher
         self.device_name = determine_device_name(self.mesh_device) if mesh_device is not None else "CPU"
+        self.dram_core_prefetch = None
+        # Two Blackhole chips joined only by PCIe (TT_PCIE_P2P_CHIPS): all-reduce over the P2P windows and a
+        # replicated (not fractured) residual stream. Defined here because the decode grid choices below read it.
+        self.pcie_tp = self.num_devices == 2 and os.environ.get("TT_PCIE_P2P_CHIPS") is not None
 
         logger.info(f"Inferring device name: {self.device_name}")
         self.cluster_shape = list(mesh_device.shape) if mesh_device is not None else None
@@ -800,7 +804,10 @@ class ModelArgs:
         self.model_config.update({f"{key}_TILE": ttnn.TILE_LAYOUT for key in self.OP_KEYS if "LAYOUT" in key})
 
         self.tokenizer = None if dummy_weights else self.create_tokenizer()
-        self.processor = None if dummy_weights else self.create_processor()
+        # The HF processor (image/video preprocessing + a second tokenizer) costs seconds to build and text-only runs
+        # never use it; it is created on first access of `self.processor` instead.
+        self._processor = None
+        self._processor_ready = dummy_weights
 
         # Flag to indicate whether we use fused version of QK ops (rotary embedding + page cached update)
         # We currently disable this fusion of ops for vision-capable or multimodal models
@@ -895,6 +902,21 @@ class ModelArgs:
             # For maximum performance, set the prefill grid row to 8, even if it can fit in a smaller grid
             self.prefill_rows = 8
             self.attn_input_grid = self.dram_shard_core_grid_for_k(self.dim)
+            # Opt-in: stream decode weights through the DRAM-core tensor prefetcher (see dram_core_prefetch.py)
+            self.dram_core_prefetch = None
+            if (
+                os.environ.get("TT_DRAM_CORE_PREFETCH", "0") == "1"
+                and self.use_wide_dram_sharded_decode_grid()
+                and self.num_devices == 1
+                and self.prefetcher is None
+            ):
+                from models.tt_transformers.tt.dram_core_prefetch import DramCorePrefetch
+
+                self.dram_core_prefetch = DramCorePrefetch(self.mesh_device)
+            if self.use_wide_dram_sharded_decode_grid():
+                # Two DRAM readers per bank stream at ~90% of DRAM BW only when the activation is spread over
+                # 64 cores (8x8); on the stock 32-core grid the same matmuls sit at ~75% (P150 microbenchmark).
+                self.attn_input_grid = ttnn.CoreGrid(y=8, x=8)
             self.mlp1_3_grid = lambda seq_len: (
                 (8, min(min(seq_len, 1024) // 32, 4))
                 if self.is_galaxy
@@ -910,6 +932,12 @@ class ModelArgs:
                 if self.is_galaxy
                 else self.dram_shard_core_grid_for_k_and_n(self.dim, self.hidden_dim // self.num_devices)
             )
+            # PCIe TP2 on P150s: the per-chip hidden dim (224 tiles) does not split over 64 cores, so find_grid_k_n
+            # settles on 32 (the ~76% DRAM-BW multicast regime). Put the w1/w3 activation on 64 cores anyway and let
+            # the matmul write 4-tile output shards onto the first 56 cores (exact); w2 then reads those 56 cores
+            # and writes 4-tile shards onto 32 cores (exact). See pcie_tp_mlp_grids().
+            if self.pcie_tp_mlp_grids():
+                self.mlp_core_grid = ttnn.CoreGrid(y=8, x=8)
 
             self.mlp2_core_grid = (
                 ttnn.CoreGrid(y=1, x=8)
@@ -1222,7 +1250,9 @@ class ModelArgs:
             default_sampling_force_argmax = {
                 # Single-chip only: the argmax fast-path speeds up greedy decode on P150
                 # (~22 -> ~38 t/s/u), but multi-chip meshes are faster on the top-k path.
-                "allow_force_argmax": self.num_devices == 1,
+                # PCIe TP2: the row-gather argmax (PcieCCL.argmax_exchange) is 91 us for batch 1 vs ~520 us for the
+                # top-k path; for large batches the top-k path is the faster one.
+                "allow_force_argmax": self.num_devices == 1 or (self.pcie_tp and self.max_batch_size <= 8),
                 "num_links": 1,
                 "chunks_per_sync": 10,
                 "num_workers_per_link": 2,
@@ -1359,6 +1389,22 @@ class ModelArgs:
                 )
             elif self.is_galaxy:
                 return ttnn.L1_MEMORY_CONFIG
+            elif getattr(self, "dram_core_prefetch", None) is not None:
+                # ring matmul outputs land on the 8x8 receiver grid
+                return self.dram_core_prefetch.out_mem_config(self.dim)
+            elif self.use_wide_dram_sharded_decode_grid() or getattr(self, "pcie_tp", False):
+                # Same placement the DRAM-sharded wo/w2 matmuls compute for their 64 output shards (row-major
+                # over the compute grid), so the attention and MLP outputs are already in the residual layout
+                # and the adds need no reshard. A 64-core row-major activation streams as fast as the 8x8 grid
+                # (P150 microbenchmark), unlike the 32-core one.
+                grid = ttnn.num_cores_to_corerangeset(64, self.mesh_device.compute_with_storage_grid_size(), True)
+                return ttnn.MemoryConfig(
+                    ttnn.TensorMemoryLayout.WIDTH_SHARDED,
+                    ttnn.BufferType.L1,
+                    ttnn.ShardSpec(
+                        grid, [self.tile_padded_batch_rows, self.dim // 64], ttnn.ShardOrientation.ROW_MAJOR
+                    ),
+                )
             else:
                 residual_grid = self.dram_shard_core_grid_for_k(self.dim // self.num_devices)
                 return ttnn.create_sharded_memory_config(
@@ -1409,7 +1455,17 @@ class ModelArgs:
             raise ValueError(f"Invalid mode: {mode}")
 
     @lru_cache(maxsize=None)
-    def get_mlp_ff1_3_prg_config(self, mode: Mode, seq_len: int = 1, prefetcher: Prefetcher = None):
+    def get_mlp_ff1_3_prg_config(
+        self,
+        mode: Mode,
+        seq_len: int = 1,
+        prefetcher: Prefetcher = None,
+        hidden_chunk: int = None,
+        fused_activation=None,
+    ):
+        """fused_activation applies only to the decode DRAM-sharded config. Measured on P150 Llama-3.1-8B: folding
+        silu into the w1 matmul made the step 0.5 ms SLOWER (17.53 vs 17.03 ms) than the separate silu-multiply,
+        so the model does not use it; kept as a knob."""
         if mode == Mode.DECODE:
             if self.dim >= 4096 and self.is_galaxy:
                 return self.matmul_1d_config_from_tensor_shapes(
@@ -1435,7 +1491,7 @@ class ModelArgs:
                         1,
                         32,
                         self.dim,
-                        self.hidden_dim // self.cluster_shape[1],  # Use padded N
+                        hidden_chunk or self.hidden_dim // self.cluster_shape[1],  # Use padded N
                         prefetcher.ring_size,
                         num_global_cb_receivers=prefetcher.num_receiver_cores,
                     )
@@ -1445,9 +1501,11 @@ class ModelArgs:
                         k=self.dim,
                         n=self.hidden_dim // self.cluster_shape[1],
                         num_cores=self.mlp_core_grid.num_cores,
+                        fused_activation=fused_activation,
                         num_workers_per_dram_bank=self.get_dram_sharded_matmul_num_workers(
                             TensorGroup.FF1_FF3, self.hidden_dim // self.cluster_shape[1]
                         ),
+                        per_core_N_override=4 if self.pcie_tp_mlp_grids() else None,
                     )
         elif mode == Mode.PREFILL:
             return self.matmul_config(
@@ -1477,7 +1535,9 @@ class ModelArgs:
             )
 
     @lru_cache(maxsize=None)
-    def get_mlp_ff2_prg_config(self, mode: Mode, seq_len: int = 1, prefetcher: Prefetcher = None):
+    def get_mlp_ff2_prg_config(
+        self, mode: Mode, seq_len: int = 1, prefetcher: Prefetcher = None, hidden_chunk: int = None
+    ):
         if mode == Mode.DECODE:
             if self.dim >= 4096 and self.is_galaxy:
                 return self.matmul_1d_config_from_tensor_shapes(
@@ -1502,7 +1562,7 @@ class ModelArgs:
                     return self.matmul_1d_ring_config(
                         1,
                         32,
-                        self.hidden_dim // self.cluster_shape[1],
+                        hidden_chunk or self.hidden_dim // self.cluster_shape[1],
                         self.dim,  # Use padded N
                         prefetcher.ring_size,
                         num_global_cb_receivers=prefetcher.num_receiver_cores,
@@ -1512,8 +1572,9 @@ class ModelArgs:
                         m=self.tile_padded_batch_rows,
                         k=self.hidden_dim // self.cluster_shape[1],
                         n=self.dim,
-                        num_cores=self.mlp2_core_grid.num_cores,
+                        num_cores=56 if self.pcie_tp_mlp_grids() else self.mlp2_core_grid.num_cores,
                         num_workers_per_dram_bank=self.get_dram_sharded_matmul_num_workers(TensorGroup.FF2, self.dim),
+                        per_core_N_override=4 if self.pcie_tp_mlp_grids() else None,
                     )
         elif mode == Mode.PREFILL:
             if self.use_minimal_prefill_matmul(seq_len):
@@ -1540,11 +1601,14 @@ class ModelArgs:
             raise ValueError(f"Invalid mode: {mode}")
 
     @lru_cache(maxsize=None)
-    def get_mlp_ff1_3_mem_config(self, mode: Mode, prefetcher: Prefetcher = None):
+    def get_mlp_ff1_3_mem_config(self, mode: Mode, prefetcher: Prefetcher = None, hidden_chunk: int = None):
         if mode == Mode.DECODE:
             if prefetcher is not None:
                 return ttnn.create_sharded_memory_config(
-                    shape=(32, self.hidden_dim // self.cluster_shape[1] // prefetcher.ring_size),  # Use padded N
+                    shape=(
+                        32,
+                        (hidden_chunk or self.hidden_dim // self.cluster_shape[1]) // prefetcher.ring_size,
+                    ),  # Use padded N
                     core_grid=prefetcher.to_core_range_set(
                         prefetcher.receiver_cores(sender_active=True, receiver_active=True)
                     ),
@@ -1834,6 +1898,8 @@ class ModelArgs:
                     num_workers_per_dram_bank=self.get_dram_sharded_matmul_num_workers(
                         TensorGroup.WQKV, self.qkv_size // self.num_devices
                     ),
+                    # one head per output shard -> create_heads reads the sharded output (16.8 -> ~6 us on P150)
+                    per_core_N_override=self.head_dim // ttnn.TILE_SIZE if self.qkv_heads_aligned_output() else None,
                 )
         elif mode == Mode.PREFILL:
             self.MAX_QKV_MM_SEQ_LEN = 2048
@@ -2127,17 +2193,38 @@ class ModelArgs:
             if self.is_galaxy:
                 return None
             else:
+                wo_input = self.get_attn_wo_input_mem_config(Mode.DECODE)
                 return self.dram_matmul_config(
                     m=self.tile_padded_batch_rows,
                     k=(self.n_heads * self.head_dim) // self.num_devices,
                     n=self.dim,
-                    num_cores=self.n_heads // self.num_devices,
+                    num_cores=wo_input.shard_spec.grid.num_cores()
+                    if wo_input is not None
+                    else self.n_heads // self.num_devices,
                     num_workers_per_dram_bank=self.get_dram_sharded_matmul_num_workers(TensorGroup.WO, self.dim),
                 )
         elif mode == Mode.PREFILL:
             return None
         else:
             raise ValueError(f"Invalid mode: {mode}")
+
+    @lru_cache(maxsize=None)
+    def get_attn_wo_input_mem_config(self, mode: Mode):
+        """Where the concatenated heads go before the decode wo matmul, or None to feed the concat_heads output
+        directly. nlp_concat_heads_decode leaves [32, head_dim] shards on n_heads cores placed row-major over the
+        whole compute grid; that placement costs the two-reader DRAM-sharded wo ~20 us on P150, and a ~2 us
+        reshard onto an 8x8 grid gets it back (61 -> 42 us)."""
+        if mode == Mode.DECODE and self.use_wide_dram_sharded_decode_grid() and self.prefetcher is None:
+            k = (self.n_heads * self.head_dim) // self.num_devices
+            if k % (64 * ttnn.TILE_SIZE) == 0:
+                return ttnn.create_sharded_memory_config(
+                    shape=(self.tile_padded_batch_rows, k // 64),
+                    core_grid=ttnn.CoreGrid(y=8, x=8),
+                    strategy=ttnn.ShardStrategy.WIDTH,
+                    orientation=ttnn.ShardOrientation.ROW_MAJOR,
+                    use_height_and_width_as_shard_shape=True,
+                )
+        return None
 
     @lru_cache(maxsize=None)
     def get_attn_wo_program_config(self, mode: Mode, seq_len: int = 1, prefetcher: Prefetcher = None):
@@ -2421,6 +2508,10 @@ class ModelArgs:
                 max_columns_per_device = LLAMA_VOCAB_SIZE // self.num_devices // NUM_LM_HEAD_COLUMNS
             elif self.num_devices == 8:
                 max_columns_per_device = LLAMA_VOCAB_SIZE // self.num_devices // (NUM_LM_HEAD_COLUMNS * 2)
+            elif self.use_wide_dram_sharded_decode_grid() and prefetcher is None:
+                # 4 chunks of 32064 columns: 126 tiles per DRAM bank (even -> 2 readers) instead of 8 x 16032
+                # (63 tiles, single reader). Measured 285 us vs 2 x 236 us per 32k columns on P150.
+                max_columns_per_device = LLAMA_VOCAB_SIZE // (NUM_LM_HEAD_COLUMNS // 2)
             else:
                 max_columns_per_device = LLAMA_VOCAB_SIZE // NUM_LM_HEAD_COLUMNS
         if prefetcher is not None:
@@ -2489,6 +2580,7 @@ class ModelArgs:
                 self.dim,
                 split_size,
                 self.lm_head_core_grid.num_cores,
+                num_workers_per_dram_bank=self.get_lm_head_dram_sharded_num_workers(split_size),
             )
 
     @lru_cache(maxsize=None)
@@ -2525,12 +2617,8 @@ class ModelArgs:
         """Get the memory config for LM head output resharding."""
         if prefetcher is None:
             return ttnn.L1_MEMORY_CONFIG
-        lm_head_output_core_range_set = ttnn.CoreRangeSet(
-            [
-                ttnn.CoreRange(ttnn.CoreCoord(1, 0), ttnn.CoreCoord(prefetcher.num_receiver_cores, 7)),
-                ttnn.CoreRange(ttnn.CoreCoord(8, 0), ttnn.CoreCoord(8 + prefetcher.num_receiver_cores - 1, 7)),
-            ]
-        )
+        # (an unused CoreRangeSet used to be built here from num_receiver_cores; it overlapped and threw for
+        # the 8/10-receiver custom mappings, so it is gone: the config below only uses the receiver cores)
 
         def next_power_of_2(n):
             if n <= 0:
@@ -2759,6 +2847,9 @@ class ModelArgs:
         Prepare inputs for decode mode.
         x: (batch, seq, dim)
         """
+        # The PCIe P2P TP2 mesh keeps the residual stream replicated (all-reduced on device); the fractured layout
+        # is only for meshes that gather inside the norm.
+        force_replicated = force_replicated or getattr(self, "pcie_tp", False)
         dims = (None, None) if force_replicated else (None, -1)
         mesh_mapper = ttnn.ShardTensor2dMesh(self.mesh_device, dims=dims, mesh_shape=self.cluster_shape)
 
@@ -3245,6 +3336,13 @@ class ModelArgs:
 
         allowed_seq_lens = self.trace_prefill_supported_seq_lens
 
+        # PCIe P2P TP2: prefill collectives run on device (PcieCCL DRAM path) and are trace-safe (persistent control
+        # tiles, write-free landing allocations); verified at batch 1 and 32 against the eager and fabric outputs.
+        # TT_PCIE_PREFILL_TRACE=0 falls back to eager prefill (needed if a host fallback ever reappears, since a
+        # host read inside capture dies with "Reads are not supported during trace capture").
+        if getattr(self, "pcie_tp", False) and os.environ.get("TT_PCIE_PREFILL_TRACE", "1") != "1":
+            return False
+
         return (
             prefill_seq_len in allowed_seq_lens
             and prefill_seq_len <= self.max_prefill_chunk_size
@@ -3361,6 +3459,13 @@ class ModelArgs:
             # cache dir; keeping the mode in the variant stops a marker seeded under one mode from
             # certifying the other. (#45400 review, finding R2)
             "hf_rope": bool(getattr(self, "use_hf_rope", False)),
+            # lm_head.py caches output_lm_head_{num_splits}_split_shard_{i}_{width}, so the column
+            # chunking is in a filename; a marker seeded under 8 x 16032 must not certify a build
+            # that needs 4 x 32064 (as_tensor would write the new chunks from the placeholder).
+            "lm_head_cols": int(getattr(self, "max_columns_per_device_lm_head", 0) or 0),
+            # dram_core_prefetch adds *_rc64 receiver-contiguous decode weights; a marker seeded without them
+            # must not certify a build that needs them.
+            "dram_core_prefetch": getattr(self, "dram_core_prefetch", None) is not None,
         }
 
     def _weight_cache_identity(self, components=None):
@@ -3852,17 +3957,105 @@ class ModelArgs:
                 return i
         return 1  # Fallback to 1 if no divisor found
 
+    def use_wide_dram_sharded_decode_grid(self) -> bool:
+        """P150 Llama-3.1-8B decode: put activations on 64 cores so the two-reader DRAM-sharded matmuls stream
+        at ~90% of DRAM BW (measured 56 vs 69 us for QKV, 42 vs 61 us for wo, 285 vs 472 us per 32k lm_head
+        columns). Same gate as get_dram_sharded_matmul_num_workers; single reader configs do not benefit."""
+        return (
+            self.base_model_name == "Llama-3.1-8B"
+            and self._p150_class_decode()
+            and self.dim % (64 * ttnn.TILE_SIZE) == 0
+        )
+
+    def pcie_tp_mlp_grids(self) -> bool:
+        """Llama-3.1-8B PCIe TP2 decode MLP: w1/w3 in0 on 64 cores -> 4-tile outputs on 56 cores -> w2 in0 on those
+        56 cores -> 4-tile outputs on 32 cores. Only valid for hidden/2 = 7168 (224 tiles) and dim = 4096."""
+        return (
+            getattr(self, "pcie_tp", False)
+            and self.use_wide_dram_sharded_decode_grid()
+            and self.hidden_dim // self.num_devices == 56 * 4 * ttnn.TILE_SIZE
+            and self.dim == 32 * 4 * ttnn.TILE_SIZE
+            and os.environ.get("TT_PCIE_TP_MLP_GRIDS", "0") == "1"  # measured slower (11.32 vs 10.9 ms), opt-in
+        )
+
+    def _p150_class_decode(self) -> bool:
+        """One P150, or two P150s in PCIe P2P tensor parallel (device name P300): the per-chip DRAM-sharded
+        projections then have 12/16/28/16 tiles per bank (QKV/wo/w1-w3/w2), all even, so the two-reader
+        configs apply unchanged."""
+        return (
+            self.device_name == "P150"
+            or getattr(self, "pcie_tp", False)
+            # Same per-chip shapes on an Ethernet-connected P300 pair (fabric collectives); opt-in for A/B runs.
+            or (self.device_name == "P300" and os.environ.get("TT_P300_DECODE_LEVERS", "0") == "1")
+        )
+
+    def mlp_hidden_split_for_prefetcher(self, prefetcher):
+        """Chunk the MLP hidden dim so every prefetched weight block fits L1 next to the ring matmul's activation.
+
+        The DRAM prefetcher hands each receiver core a whole per-tensor block (hidden/32 x dim/32 tiles / ring)
+        and the gather_in0 ring matmul keeps the full [32, hidden] activation in a CB on every core. On one P150
+        Llama-3.1-8B's w2 needs 975 KB + 487 KB, which does not fit 1.5 MB with the rest. Splitting the hidden
+        dim into ring-aligned chunks (w1/w3 by columns, w2 by rows, partial sums added) shrinks both.
+        Returns a tuple of chunk widths, or None when the unsplit tensors fit."""
+        if prefetcher is None:
+            return None
+        ring = prefetcher.ring_size
+        unit = ring * ttnn.TILE_SIZE
+        hidden = self.hidden_dim // self.cluster_shape[1]
+        budget = 1_000_000  # bytes per receiver core for weight block + activation CB (L1 is 1.5 MB)
+
+        def cost(h):
+            w2_block = (h // ttnn.TILE_SIZE) * (self.dim // ttnn.TILE_SIZE) // ring * 1088
+            in0 = (h // ttnn.TILE_SIZE) * 1088  # [32, h] bfp8 activation gathered on every core
+            return w2_block + in0
+
+        if cost(hidden) <= budget:
+            return None
+        assert hidden % unit == 0, f"hidden_dim {hidden} must be a multiple of ring_size*TILE ({unit}) to split"
+        chunks = []
+        remaining = hidden
+        while remaining > 0:
+            h = remaining
+            while h > unit and cost(h) > budget:
+                h -= unit
+            chunks.append(h)
+            remaining -= h
+        return tuple(chunks)
+
+    def qkv_heads_aligned_output(self) -> bool:
+        """Decode QKV matmul writes head_dim-wide output shards so nlp_create_qkv_heads_decode can consume them
+        sharded (no sharded_to_interleaved, and the cheaper sharded kernel)."""
+        return (
+            self.use_wide_dram_sharded_decode_grid()
+            and self.head_dim % ttnn.TILE_SIZE == 0
+            and (self.qkv_size // self.num_devices) % self.head_dim == 0
+        )
+
+    def fuse_kv_append_in_sdpa(self) -> bool:
+        """Decode: let paged SDPA insert the new K/V row into the cache (k_new/v_new) instead of running
+        paged_update_cache. Same P150 Llama-3.1-8B gate as the other decode levers while it is being validated."""
+        return self.use_wide_dram_sharded_decode_grid()
+
+    def _dram_sharded_two_reader_count(self, n: int) -> int:
+        num_workers = 2
+        shard_width_tiles = math.ceil(n / (ttnn.TILE_SIZE * self.dram_grid_size.x))
+        return num_workers if shard_width_tiles % num_workers == 0 else 1
+
     def get_dram_sharded_matmul_num_workers(self, tensor_group: TensorGroup, n: int) -> int:
         """Return the validated P150 reader count for a Llama 3.1 8B decode projection."""
-        if self.base_model_name != "Llama-3.1-8B" or self.device_name != "P150":
+        if self.base_model_name != "Llama-3.1-8B" or not self._p150_class_decode():
             return 1
 
         if tensor_group not in (TensorGroup.FF1_FF3, TensorGroup.FF2, TensorGroup.WQKV, TensorGroup.WO):
             return 1
 
-        num_workers = 2
-        shard_width_tiles = math.ceil(n / (ttnn.TILE_SIZE * self.dram_grid_size.x))
-        return num_workers if shard_width_tiles % num_workers == 0 else 1
+        return self._dram_sharded_two_reader_count(n)
+
+    def get_lm_head_dram_sharded_num_workers(self, n: int) -> int:
+        """Reader count for one lm_head column chunk (same P150 Llama-3.1-8B gate as the projections)."""
+        if not self.use_wide_dram_sharded_decode_grid():
+            return 1
+        return self._dram_sharded_two_reader_count(n)
 
     def dram_matmul_config(
         self,
@@ -3872,7 +4065,11 @@ class ModelArgs:
         num_cores=None,
         fused_activation=None,
         num_workers_per_dram_bank: int = 1,
+        per_core_N_override: int = None,
     ):
+        """per_core_N_override sets the OUTPUT shard width in tiles independently of num_cores (which sizes the
+        in0 storage grid): e.g. head_dim-wide QKV output shards let nlp_create_qkv_heads_decode read the sharded
+        matmul output directly instead of going through interleaved."""
         # in0_block_w must evenly divide k and be no larger than tile_size * num_cores
         if num_cores is None:
             # num_cores = self.dram_shard_core_grid_for_k(k).num_cores
@@ -3888,7 +4085,7 @@ class ModelArgs:
         return ttnn.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(
             in0_block_w=in0_block_w,
             per_core_M=math.ceil(m / ttnn.TILE_SIZE),
-            per_core_N=math.ceil(n / (ttnn.TILE_SIZE * num_cores)),
+            per_core_N=per_core_N_override or math.ceil(n / (ttnn.TILE_SIZE * num_cores)),
             fused_activation=fused_activation,
             num_workers_per_dram_bank=num_workers_per_dram_bank,
         )
@@ -4177,6 +4374,18 @@ class ModelArgs:
             if "phi-3-mini" in self.base_model_name.lower():
                 tokenizer.stop_tokens.append(tokenizer.encode("<|end|>")[0])
         return tokenizer
+
+    @property
+    def processor(self):
+        if not self._processor_ready:
+            self._processor = self.create_processor()
+            self._processor_ready = True
+        return self._processor
+
+    @processor.setter
+    def processor(self, value):
+        self._processor = value
+        self._processor_ready = True
 
     def create_processor(self):
         from transformers import AutoProcessor

@@ -2169,6 +2169,15 @@ uint32_t process_exec_buf_cmd(
         }
     }
 
+    // A mesh trace buffer is sized to the longest device-range stream and EXEC_BUF reads that many pages on every
+    // device, so a device whose own stream is shorter reaches EXEC_BUF_END with the read-ahead of the next chunk
+    // (trid 1, paged_read_into_cmddat_q) still in flight. The host-command fetcher's reads use trids >= 2 and never
+    // wait for it: it would land in cmddat_q over the host commands fetched after this exec_buf. Drain it here.
+    if (exec_buf_state.prefetch_length != 0) {
+        noc_async_read_barrier_with_trid(1);
+        exec_buf_state.prefetch_length = 0;
+    }
+
     return CQ_PREFETCH_CMD_BARE_MIN_SIZE;
 }
 

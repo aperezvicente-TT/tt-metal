@@ -53,7 +53,7 @@ Step 7 defines how to post when the PR head has moved.
   to a file. Keep coordination and comment preparation in context.
 - Read current code and surrounding context only under `H`; read baseline code
   only under `B`. Never read repository implementation from the checkout root,
-  another branch, a Claude execution file, or a tool-result cache.
+  another branch, a the program execution file, or a tool-result cache.
 - Use Read, Grep, and Glob for files under `H`, `B`, and `K`. Use Bash only for
   one direct, single-line `gh api` command, the intake agent's one `gh pr view`
   metadata call, or one read-only `git diff`, `git show`, `git log`, or
@@ -109,7 +109,7 @@ Follow these steps precisely:
    comment signature footer, selects `.html_url`, verifies that it
    is non-empty, then stops. Review every open
    PR that was explicitly dispatched, including draft, automated,
-   Claude-generated, and trivial PRs.
+   the program-generated, and trivial PRs.
 
 2. Launch a Haiku agent to return only the paths of applicable `CLAUDE.md` files:
    the exact-head root file under `H` if present, plus files under `H` in or above

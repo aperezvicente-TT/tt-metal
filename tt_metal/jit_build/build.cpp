@@ -265,8 +265,13 @@ void JitBuildEnv::init(
     // Tools
     const static bool use_ccache = std::getenv("TT_METAL_CCACHE_KERNEL_SUPPORT") != nullptr;
     if (use_ccache) {
-        // ccache requires sloppiness settings for both PCH creation and consumption
-        this->gpp_ = "ccache sloppiness=pch_defines,time_macros ";
+        // ccache requires sloppiness settings for both PCH creation and consumption. They come from the environment
+        // (CCACHE_SLOPPINESS=pch_defines,time_macros): the "ccache key=value compiler" form needs ccache >= 4.8 and
+        // older ccache (4.5 on Ubuntu 22.04) takes "sloppiness=..." for the compiler name, failing every JIT build.
+        if (std::getenv("CCACHE_SLOPPINESS") == nullptr) {
+            setenv("CCACHE_SLOPPINESS", "pch_defines,time_macros", 0);
+        }
+        this->gpp_ = "ccache ";
     } else {
         this->gpp_ = "";
     }

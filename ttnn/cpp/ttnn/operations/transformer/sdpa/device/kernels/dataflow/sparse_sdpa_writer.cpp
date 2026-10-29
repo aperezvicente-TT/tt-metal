@@ -47,11 +47,19 @@ void kernel_main() {
     constexpr bool use_attention_sink = get_compile_time_arg_val(sparse_sdpa::writer_ct_arg::USE_ATTENTION_SINK) != 0;
     constexpr uint32_t cb_attention_sink = get_compile_time_arg_val(sparse_sdpa::writer_ct_arg::CB_ATTENTION_SINK);
     constexpr uint32_t cb_sink_scratch = get_compile_time_arg_val(sparse_sdpa::writer_ct_arg::CB_SINK_SCRATCH);
+    constexpr bool emit_stats = get_compile_time_arg_val(sparse_sdpa::writer_ct_arg::EMIT_STATS) != 0;
+    constexpr uint32_t cb_stats = get_compile_time_arg_val(sparse_sdpa::writer_ct_arg::CB_STATS);
+    constexpr uint32_t cb_stats_rm = get_compile_time_arg_val(sparse_sdpa::writer_ct_arg::CB_STATS_RM);
     constexpr auto out_args =
         TensorAccessorArgs<sparse_sdpa::writer_ct_arg::END, sparse_sdpa::writer_common_arg::END>();
     // kv carries a RUNTIME tensor shape (T dim in common runtime args), so its accessor spans both arg streams.
     constexpr auto kv_args =
         TensorAccessorArgs<out_args.next_compile_time_args_offset(), out_args.next_common_runtime_args_offset()>();
+    // the sink's accessor (null when unused) then the stats output's (null when emit_stats is off)
+    constexpr auto sink_args_all =
+        TensorAccessorArgs<kv_args.next_compile_time_args_offset(), kv_args.next_common_runtime_args_offset()>();
+    constexpr auto stats_args =
+        TensorAccessorArgs<sink_args_all.next_compile_time_args_offset(), sink_args_all.next_common_runtime_args_offset()>();
 
     const uint32_t out_addr = get_common_arg_val<uint32_t>(sparse_sdpa::writer_common_arg::OUTPUT_ADDRESS);
     const uint32_t tok_start = get_arg_val<uint32_t>(0);
@@ -188,5 +196,35 @@ void kernel_main() {
         }
         noc.async_write_barrier();
         out_cb.pop_front(block_tiles);
+        if constexpr (emit_stats) {
+            // the split-K statistics of this token: 2 Sqt fp32 tiles from the compute (Sqt running-max tiles, then
+            // Sqt row-sum tiles; the value of head h sits at column 0 of row h % 32 of tile h / 32) -> one
+            // row-major page [m_0 .. m_H-1, l_0 .. l_H-1] at stats page `tok`
+            constexpr uint32_t Sqt = H / tt::constants::TILE_HEIGHT;
+            constexpr uint32_t faces_per_row = tt::constants::TILE_WIDTH / tt::constants::FACE_WIDTH;
+            constexpr uint32_t stats_row_bytes = 2 * H * sizeof(float);
+            static_assert(stats_row_bytes % NOC_DRAM_READ_ALIGNMENT_BYTES == 0);
+            const auto stats = TensorAccessor(stats_args, get_common_arg_val<uint32_t>(sparse_sdpa::writer_common_arg::STATS_ADDRESS));
+            experimental::CB stats_cb(cb_stats), stats_rm_cb(cb_stats_rm);
+            stats_cb.wait_front(2 * Sqt);
+            stats_rm_cb.reserve_back(1);
+            auto* src = reinterpret_cast<volatile tt_l1_ptr float*>(stats_cb.get_read_ptr());
+            auto* dst = reinterpret_cast<volatile tt_l1_ptr float*>(stats_rm_cb.get_write_ptr());
+            for (uint32_t g = 0; g < 2; ++g) {  // 0 = m, 1 = l
+                for (uint32_t h = 0; h < H; ++h) {
+                    const uint32_t row = h % tt::constants::TILE_HEIGHT;
+                    const uint32_t off = (g * Sqt + h / tt::constants::TILE_HEIGHT) * tt::constants::TILE_HW +
+                                         (row / tt::constants::FACE_HEIGHT) * faces_per_row * tt::constants::FACE_HW +
+                                         (row % tt::constants::FACE_HEIGHT) * tt::constants::FACE_WIDTH;
+                    dst[g * H + h] = src[off];
+                }
+            }
+            noc.async_write(stats_rm_cb, stats, stats_row_bytes, {.offset_bytes = 0}, {.page_id = tok});
+            noc.async_write_barrier();
+            stats_rm_cb.push_back(1);
+            stats_rm_cb.wait_front(1);
+            stats_rm_cb.pop_front(1);
+            stats_cb.pop_front(2 * Sqt);
+        }
     }
 }

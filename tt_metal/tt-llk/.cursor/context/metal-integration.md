@@ -124,7 +124,7 @@ Grep for "{operation}" in tests/tt_metal/tt_metal/llk/ (*.cpp files)
 
 *e.g., replace `face_r_dim` / `num_faces` with `ckernel::TensorShape` on unpack/math/pack*
 
-Follow `.claude/references/tensor-shape.md` (Claude skill `tensor-shape` / Cursor rule `tensor-shape`). Coverage is TRISC-scoped — new APIs call `LLK_VALIDATE_TENSOR_SHAPE_*` with a string literal; they do **not** register in a central API list in `coverage.h`. Then continue with Scenario 1 for metal-layer propagation.
+Follow `.claude/references/tensor-shape.md` (the program skill `tensor-shape` / Cursor rule `tensor-shape`). Coverage is TRISC-scoped — new APIs call `LLK_VALIDATE_TENSOR_SHAPE_*` with a string literal; they do **not** register in a central API list in `coverage.h`. Then continue with Scenario 1 for metal-layer propagation.
 
 ---
 

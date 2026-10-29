@@ -28,7 +28,10 @@ ttnn::Tensor moe_fused_swiglu(
     const std::optional<std::vector<ttnn::Tensor>>& up_biases,
     const std::optional<std::vector<ttnn::Tensor>>& down_biases,
     uint32_t min_active_tokens,
-    uint32_t max_active_tokens) {
+    uint32_t max_active_tokens,
+    bool gate_up_interleaved,
+    uint32_t l1_budget_bytes,
+    const std::optional<ttnn::Tensor>& x_row_index) {
     constexpr uint32_t TILE = 32;
     TT_FATAL(!w_gates.empty(), "moe_fused_swiglu: at least one local expert is required");
     TT_FATAL(
@@ -50,7 +53,16 @@ ttnn::Tensor moe_fused_swiglu(
         activations_rank == 2 || activations_rank == 4,
         "moe_fused_swiglu: activations must have rank 2 or 4, got {}",
         activations_rank);
-    const uint32_t capacity_tiles = activations.padded_shape()[-2] / TILE;
+    // Gathered x read: the region space is x_row_index's length, so that -- not the (undispatched) activation
+    // rows -- is the default per-expert tile bound, exactly what a dispatched buffer of that length gave.
+    // Storage is checked here for the same ordering reason as the activations; validate() does the rest.
+    if (x_row_index.has_value()) {
+        TT_FATAL(
+            x_row_index->storage_type() == StorageType::DEVICE && x_row_index->is_allocated(),
+            "moe_fused_swiglu: x_row_index must be an allocated device tensor");
+    }
+    const uint32_t capacity_tiles =
+        (x_row_index.has_value() ? x_row_index->logical_shape()[-1] : activations.padded_shape()[-2]) / TILE;
     const uint32_t m_tiles = input_m_tiles.value_or(capacity_tiles);
     const auto device_grid = activations.device()->compute_with_storage_grid_size();
     if (core_grid.has_value()) {
@@ -114,7 +126,10 @@ ttnn::Tensor moe_fused_swiglu(
         output,
         expert_region_offsets,
         min_active_tokens,
-        max_active_tokens);
+        max_active_tokens,
+        gate_up_interleaved,
+        l1_budget_bytes,
+        x_row_index);
 }
 
 }  // namespace ttnn::operations::experimental::deepseek_prefill::moe_fused_swiglu

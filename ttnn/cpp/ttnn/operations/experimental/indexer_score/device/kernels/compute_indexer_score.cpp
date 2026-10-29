@@ -55,6 +55,13 @@ constexpr uint32_t shard_physical_sp = get_compile_time_arg_val(num_common_ct_ar
 // shard_key_stripes ahead of the physical SP size, so these moved from +10/+11 to +11/+12.
 constexpr bool chunk_start_from_metadata = get_compile_time_arg_val(num_common_ct_args + 11) != 0;
 constexpr uint32_t cb_meta_derived = get_compile_time_arg_val(num_common_ct_args + 12);
+// EXACT head reduction at any resident head count (IndexerScoreProgramConfig::serial_head_reduce): the factory
+// forces heads_per_dest_pass = qk_batch_heads = qk_col_batch = 1 and sizes cb_qk to the resident group, and
+// accumulate_heads runs the group's matmuls back to back under ONE matmul mode, then the gate MAC + L1-accumulate
+// pack ONE head at a time under ONE mul mode -- per head exactly the streaming default's instructions (one head per
+// DEST pass, relu'd pack to a bf16 cb_qk tile, one bcast-mul onto the zeroed DEST, one L1-acc pack), so the score
+// is bitwise the default's with q / w read once per group instead of once per (k tile, head).
+constexpr bool serial_head_reduce = get_compile_time_arg_val(num_common_ct_args + 13) != 0;
 
 // k-cols sharing ONE dest acquire in the blocked-custom mul (dest-bounded). One unpack context per head
 // (w[h] + ct_dim qk cols), so unpack-context sync is paid 1/ct_dim of the per-tile bcast-mul rate.
@@ -191,6 +198,28 @@ inline void accumulate_heads(uint32_t q_row, uint32_t k_col, uint32_t acc_slot) 
     for (uint32_t group_start = 0; group_start < num_heads; group_start += heads_per_group) {
         if constexpr (stream_heads) {
             q.wait_front(q_group_tiles);
+        }
+        if constexpr (serial_head_reduce) {
+            static_assert(
+                !serial_head_reduce || (qk_batch_heads == 1 && heads_per_group % heads_per_dest_pass == 0),
+                "serial: the gate phase is one head per pass; the matmul passes tile the resident group");
+            // PHASE 1: every resident head's act(q.kT) back to back (heads_per_dest_pass independent per-head tile
+            // matmuls per DEST pass, each packed to its own bf16 cb_qk tile; cb_qk holds the group).
+            set_matmul_mode<cb_q, cb_k, cb_qk>();
+            for (uint32_t head = 0; head < heads_per_group; head += heads_per_dest_pass) {
+                matmul_relu_pass<cb_q, cb_k, cb_qk>(head, q_row, k_col);
+            }
+            // PHASE 2: the default's per-head gate MAC + L1-accumulate pack, head by head, in head order.
+            set_mul_mode<cb_qk, cb_w, acc_cb>();
+            const uint32_t w_base = q_row * num_heads + group_start;
+            for (uint32_t head = 0; head < heads_per_group; ++head) {
+                mul_accum_chunk<cb_qk, cb_w, acc_cb>(w_base + head, 1, first, acc_slot);
+                first = false;
+            }
+            if constexpr (stream_heads) {
+                q.pop_front(q_group_tiles);
+            }
+            continue;
         }
         // per chunk (cb_qk capacity): matmul it, then MAC its head sum into DEST once -- so the
         // matmul<->eltwise reinit and the acc pack are per chunk, not per head
@@ -491,8 +520,8 @@ void kernel_main() {
         group_stride,
         {schedule_ring_size, schedule_units, 0, 0, schedule_blocks, schedule_cols, schedule_rotate});
     const uint32_t row_group0 = schedule.row_group;
-    const uint32_t band0 = schedule.band_start;
-    const uint32_t num_bands = schedule.band_count;
+    uint32_t band0 = schedule.band_start;
+    uint32_t num_bands = schedule.band_count;
     constexpr uint32_t max_bands = schedule_max_bands;
     // Valid KV length in tiles: caps each cell's valid cols (mask suffix grows over the tail). Full when
     // unset (dense path unchanged). Hash-excluded.
@@ -515,6 +544,16 @@ void kernel_main() {
         straddle_q_tile = ckernel::read_tile_value(cb_meta_derived, 0, indexer_score_straddle_q_tile_word);
         straddle_jump_tiles = ckernel::read_tile_value(cb_meta_derived, 0, indexer_score_straddle_jump_tiles_word);
         cb_derived.pop_front(1);
+        if constexpr (!fused_ring_enabled) {  // the kv-balanced split: the reader's and the writer's derivation
+            const auto kvs = indexer_schedule::for_core_kv(
+                core_id,
+                group_stride,
+                {schedule_ring_size, schedule_units, 0, 0, schedule_blocks, schedule_cols, schedule_rotate},
+                kv_len_tiles,
+                k_tiles_per_unit);
+            band0 = kvs.band_start;
+            num_bands = kvs.band_count;
+        }
     }
     if (num_groups == 0 || num_bands == 0) {
         return;

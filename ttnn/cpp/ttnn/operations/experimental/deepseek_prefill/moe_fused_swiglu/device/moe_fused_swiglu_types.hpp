@@ -38,6 +38,20 @@ struct OperationArguments {
     // tensors, and hashed below so a biased and a bias-free dispatch of the same shape cannot share
     // a cached program -- the kernels select the bias adds with a compile-time FUSE_BIAS define.
     bool fuse_bias = false;
+    // Gate and up read from ONE [emb, 2 * hidden] tensor per expert whose tile columns interleave
+    // [gate_0 | up_0 | gate_1 | up_1 ...] (the routed-expert layout of the GLM-5.3-Flash decode stack:
+    // fused_experts' per-core gate|up shards). w_gates[e] and w_ups[e] are that same tensor; the
+    // reader takes even tile columns, the writer odd ones. Hashed: a different kernel define.
+    bool gate_up_interleaved = false;
+    // Upper bound on the op's static CB bytes per core (0 = the whole unreserved worker L1). A caller whose process
+    // keeps persistent L1 tensors (a decode stack's intermediates pools) passes the room under them: tt-metal refuses a
+    // program whose CB region ends above the lowest L1 buffer of its cores. Hashed: it selects the geometry.
+    uint32_t l1_budget_bytes = 0;
+    // Gathered x read (x_row_index): dispatch row d of an expert's region reads its activation stick from
+    // input row x_row_index[d] instead of row d, so a caller can pass the UNDISPATCHED token rows and skip the
+    // dispatch gather. Derived from the presence of x_row_index and hashed, like fuse_bias: the reader selects
+    // the gathered address with a compile-time MOE_GATHER_X define and carries one extra scratch CB.
+    bool gather_x = false;
     tt::tt_metal::DataType output_dtype = tt::tt_metal::DataType::BFLOAT8_B;
     tt::tt_metal::MemoryConfig output_memory_config{
         tt::tt_metal::TensorMemoryLayout::INTERLEAVED, tt::tt_metal::BufferType::DRAM};
@@ -53,6 +67,9 @@ struct OperationArguments {
         "max_active_tokens",
         "activation",
         "fuse_bias",
+        "gate_up_interleaved",
+        "l1_budget_bytes",
+        "gather_x",
         "output_dtype",
         "output_memory_config",
         "compute_kernel_config");
@@ -68,6 +85,9 @@ struct OperationArguments {
             max_active_tokens,
             activation,
             fuse_bias,
+            gate_up_interleaved,
+            l1_budget_bytes,
+            gather_x,
             output_dtype,
             output_memory_config,
             compute_kernel_config);
@@ -93,6 +113,11 @@ struct TensorArguments {
     Tensor global_expert_idx_table;
     std::optional<Tensor> optional_output;
     std::optional<Tensor> expert_region_offsets;
+    // Optional UINT32 ROW_MAJOR [.., N] dispatch-row -> input-row table (one DRAM page): with read_x_at_offset
+    // and bf16 ROW_MAJOR activations, dispatch row d of an expert's region reads activations row
+    // x_row_index[d]. N (not the activation rows) is then the region space that expert_region_offsets index
+    // and the shared output mirrors. Last member, so its buffer enumerates after every existing one.
+    std::optional<Tensor> x_row_index;
 };
 
 }  // namespace ttnn::operations::experimental::deepseek_prefill::moe_fused_swiglu

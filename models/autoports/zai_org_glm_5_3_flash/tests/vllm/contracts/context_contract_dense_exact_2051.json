@@ -1,0 +1,617 @@
+{
+  "model": "zai-org/GLM-5.3-Flash",
+  "hf_revision": "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a",
+  "stage": "01-functional-decoder (single 1x1 Blackhole mesh on host-8chip: card0 chip 0 through 2026-10-16 15:31Z, card1 chip 2 afterwards); measured tt/ code bc9b4cd9239 (long-context runs: 420f2468d0b, KDA prefill unchanged; F7 probe: d158c406896, prefill unchanged)",
+  "hf_config_field": "text_config.max_position_embeddings",
+  "hf_advertised_context": 1048576,
+  "target_context": 1048576,
+  "current_supported_context": 2051,
+  "supported_context_note": "Decoder-wide value = minimum over layer kinds. KDA layer kinds (dense_kda, sparse_kda) support the full advertised 1,048,576 tokens; the MLA/DSA kind (sparse_dsa) is implemented in the dense-exact DSA regime kv_len <= 2051 only (see capability_reduction).",
+  "supported_context_by_layer_kind": {
+    "dense_kda": 1048576,
+    "sparse_kda": 1048576,
+    "sparse_dsa": 2051
+  },
+  "tested_context_by_layer_kind": {
+    "dense_kda": {
+      "prefill_tokens": 1048575,
+      "decode_context": 1048576,
+      "evidence": "doc/ttnn/01-functional-decoder/long_context.jsonl (layers 0 and 1: 1,048,575-token streamed chunked prefill + traced decode at position 1,048,575; first 32K call vs the fp32 golden; last 2,048-token chunk and the decode step vs the fp32 CPU layer started from the device's carried state); doc/ttnn/01-functional-decoder/kda_drift.jsonl (device recurrent state vs an independent fp32 CPU run of the layer's attention half over the same input at 32K/64K/256K/1M); golden prompts up to 32,768 in doc/ttnn/01-functional-decoder/pcc_real_weights.jsonl"
+    },
+    "sparse_kda": {
+      "prefill_tokens": 1048575,
+      "decode_context": 1048576,
+      "evidence": "doc/ttnn/01-functional-decoder/long_context.jsonl (layer 4: 1,048,575-token streamed chunked prefill + traced decode at position 1,048,575; first 32K call vs the fp32 golden; last 2,048-token chunk and the decode step vs the fp32 CPU layer started from the device's carried state); doc/ttnn/01-functional-decoder/kda_drift.jsonl (device recurrent state vs an independent fp32 CPU run of the layer's attention half over the same input at 32K/64K/256K/1M); golden prompts up to 32,768 in doc/ttnn/01-functional-decoder/pcc_real_weights.jsonl; layer 44 golden prompts up to 4,096"
+    },
+    "sparse_dsa": {
+      "prefill_tokens": 2051,
+      "decode_context": 2051,
+      "evidence": "doc/ttnn/01-functional-decoder/pcc_real_weights.jsonl test=lengths (prefill 1..2051 on layer 3), test=follow_on_decode (traced decode positions 2045..2050 => kv_len 2051), test=prefill_under_live_trace (requests to 2046 tokens), golden prompts 128/512/2048 on layers 3, 7, 43; tests/test_contract.py (guard: 2051 accepted, 2052 raises)"
+    }
+  },
+  "capability_reduction": {
+    "applies_to": "sparse_dsa layer kind (MLA/DSA + MoE, layers 3, 7, 11, ..., 43)",
+    "supported_context": 2051,
+    "hard_physical_limit": false,
+    "reduction_reason": "stage_scope_directive",
+    "directive": "Stage-1 goal, GLM-5.3-Flash directives (2026-10-15): 'Scope for this stage: ... MoE+MLA/DSA (e.g. L3) with the DSA path restricted to kv_len <= 2051 (dense MLA is exact there)'.",
+    "why_2051": "DSA keeps the top 512 complete 4-token pools (2048 tokens) + the <= 3 newest tokens per query; for kv_len <= 2051 every visible token is selected, so dense causal latent attention equals the HF computation exactly (doc/architecture.md section 4). Beyond 2051 the indexer selects a strict subset; dense attention would silently diverge from HF, so tt/indexer.py::check_dense_exact rejects such contexts (allocate_cache, prefill, decode-position validation).",
+    "capacity_math_not_limiting": {
+      "latent_cache_bytes_per_token_per_layer_bf16": 1024,
+      "latent_cache_bytes_at_1048576_tokens_per_user_per_layer": 1073741824,
+      "pooled_indexer_keys_bytes_at_1048576_tokens_bf16": 67108864,
+      "moe_layer_weights_bytes_bfp4_bfp8": 4260000000,
+      "chip_dram_bytes": 34359738368,
+      "conclusion": "One MLA/DSA layer + a 1M-token latent cache for one user is ~5.4 GB on a 32 GiB chip: device DRAM does not limit the context; the bound is the deferred sparse indexer path."
+    },
+    "lifted_by": "DSA sparse path: k-pooled indexer key cache (128 values per 4 tokens + <= 3 staged rows), indexer scores (ttnn.experimental.indexer_score_dsa), top-512 pools (ttnn.experimental.topk_large_indices) + tail, sparse latent attention; validated against goldens layer_io/L03,L07/4096,32768 topk.pt. Required before a full-model stage serves contexts > 2051."
+  },
+  "batch": {
+    "max_tested_decode_batch": 32,
+    "evidence": "doc/ttnn/01-functional-decoder/pcc_real_weights.jsonl test=batched_paged_decode (layers 0, 4, 3 at B=32; layer 3 at B=4), test=prefill_under_live_trace (B=4)"
+  },
+  "cache_semantics": {
+    "kda": "per slot: recurrent state S [1, 64, 128, 128] fp32 + the last 3 pre-conv q|k|v rows [1, 3, 24576] bf16; persistent buffers updated only by in-place ttnn.copy; no positional input",
+    "mla": "paged latent cache [slots * blocks_per_seq, 1, 64, 512] bf16, blocks_per_seq = round_up(ceil((max_seq_len + 63) / 64), 8) (padded tail of the last chunk + 32-byte page-table sticks); caller page table [slots, blocks_per_seq] int32; continuation starts at multiples of the 64-token page",
+    "decode_inactive_slots": "cur_pos[u] == -1 marks slot u inactive (idle, or between the chunks of its own prefill): KDA S and conv rows stay bit-identical, MLA skips the cache write and attention; test_decode_between_prefill_chunks[0,4,3] (doc/ttnn/01-functional-decoder/interleaved_decode.jsonl)",
+    "page_table_refresh": "update_page_table rewrites the bound device page table in place at a request boundary (a live decode trace keeps reading the same buffer); exercised under a live trace in test_decode_between_prefill_chunks[3]"
+  },
+  "prefill": {
+    "chunk_tokens": 2048,
+    "physical_alignment": {
+      "kda": 32,
+      "mla": 64
+    },
+    "program_signature": "depends only on the physical chunk length; prepare_prefill compiles every bucket (once per layer kind and device in the optimized decoder, C-4) before a decode trace is captured; prepare_prefill_traces compiles the traced bucket set",
+    "continuation": {
+      "kda": "any start_pos",
+      "mla": "start_pos multiple of the 64-token page"
+    },
+    "traced": {
+      "api": "OptimizedDecoder.prepare_prefill_traces(cache) -> {bucket: PrefillTrace}; capture_prefill_traces(cache, traces); run_prefill_trace(trace, cache, user_slot, chunk_start, n_valid, chunk=host tensor); prefill_forward_traced(streams, cache, traces, user_slot, start_pos); release_prefill_traces(traces)",
+      "buckets": {
+        "kda": [
+          32,
+          64,
+          128,
+          256,
+          512,
+          1024,
+          2048
+        ],
+        "mla": [
+          64,
+          128,
+          256,
+          512,
+          1024,
+          2048
+        ]
+      },
+      "bucket_rule": "alignment x 2^i up to the 2048-token chunk (OptimizedDecoderConfig.prefill_trace_buckets='pow2'); only buckets <= the cache's reachable chunk are captured",
+      "chunk_plan": "plan_traced_chunks: full 2048-token chunks, then descending bucket-sized pieces, the last piece (< alignment) padded to the alignment; every chunk is exactly full except the last, whose padding is shorter than the alignment (the eager contract's padding rule); MLA chunk starts stay multiples of the 64-token page",
+      "trace_scope": "one trace per (layer, bucket); slot-independent: KDA via the scratch recurrent state cache.kda.prefill_S (slot state copied in before / written back with fill_cache after each replay, eager) and the device one-hot slot_mask; MLA via the device chunk / user page tables and chunk start of begin_prefill_chunk",
+      "buffers": "persistent [1,1,bucket,16384] fp32 input and output per bucket; the trace copies the layer output into the output buffer (valid until the next replay of that bucket)",
+      "setup_order": "allocate_cache / make_page_table -> prepare_prefill_traces (buffers + one eager run per bucket: every program compiled, every lazy constant built) -> warm + capture decode traces -> capture_prefill_traces; no program compiled and no long-lived buffer allocated after the first capture",
+      "trace_lifetime": "traces live with the layer's cache; release_prefill_traces frees them and their buffers",
+      "evidence": "doc/ttnn/03-optimized-decoder/prefill_trace.jsonl, prefill_trace_perf.jsonl (TT_METAL_TRACE_ALLOC_TRACKING=1 TT_METAL_TRACE_ALLOC_SKIP_PROGRAM_CACHE=0 for the correctness rows)"
+    }
+  },
+  "kda_state_accuracy": {
+    "reference": "independent fp32 CPU run (golden streams_in -> attn mHC pre -> input norm -> KDA) over the cycled 1M-token input of tests/test_long_context.py; scripts/f1_cpu_longref.py, scripts/compare_kda_drift.py",
+    "rows": [
+      {
+        "layer": 0,
+        "tokens": 32768,
+        "state_pcc_vs_independent_fp32": 0.9999753094200807,
+        "rel_l2_err": 0.007059597580679503,
+        "norm_ratio_dev_over_ref": 0.9992990358567191
+      },
+      {
+        "layer": 0,
+        "tokens": 65536,
+        "state_pcc_vs_independent_fp32": 0.999975316943157,
+        "rel_l2_err": 0.007058150140200121,
+        "norm_ratio_dev_over_ref": 0.9993030380134067
+      },
+      {
+        "layer": 0,
+        "tokens": 262144,
+        "state_pcc_vs_independent_fp32": 0.9999753001632466,
+        "rel_l2_err": 0.007060741535598387,
+        "norm_ratio_dev_over_ref": 0.9993007736499908
+      },
+      {
+        "layer": 0,
+        "tokens": 1048576,
+        "state_pcc_vs_independent_fp32": 0.9999789633162992,
+        "rel_l2_err": 0.006497287565597112,
+        "norm_ratio_dev_over_ref": 0.9996024126848647
+      },
+      {
+        "layer": 1,
+        "tokens": 32768,
+        "state_pcc_vs_independent_fp32": 0.9999682110958547,
+        "rel_l2_err": 0.008206547097152234,
+        "norm_ratio_dev_over_ref": 0.9980264197326804
+      },
+      {
+        "layer": 1,
+        "tokens": 65536,
+        "state_pcc_vs_independent_fp32": 0.9999689483961763,
+        "rel_l2_err": 0.008107818160808985,
+        "norm_ratio_dev_over_ref": 0.9980625364405591
+      },
+      {
+        "layer": 1,
+        "tokens": 262144,
+        "state_pcc_vs_independent_fp32": 0.9999697916025448,
+        "rel_l2_err": 0.007997060815103714,
+        "norm_ratio_dev_over_ref": 0.9980890853533582
+      },
+      {
+        "layer": 1,
+        "tokens": 1048576,
+        "state_pcc_vs_independent_fp32": 0.9999873777837229,
+        "rel_l2_err": 0.00509979001898728,
+        "norm_ratio_dev_over_ref": 0.999113541564445
+      },
+      {
+        "layer": 4,
+        "tokens": 32768,
+        "state_pcc_vs_independent_fp32": 0.9999687360237984,
+        "rel_l2_err": 0.00844166446182947,
+        "norm_ratio_dev_over_ref": 0.9970133011486892
+      },
+      {
+        "layer": 4,
+        "tokens": 65536,
+        "state_pcc_vs_independent_fp32": 0.9999687312669735,
+        "rel_l2_err": 0.008442982030517443,
+        "norm_ratio_dev_over_ref": 0.9970111431729208
+      },
+      {
+        "layer": 4,
+        "tokens": 262144,
+        "state_pcc_vs_independent_fp32": 0.9999687212650262,
+        "rel_l2_err": 0.008443152804399659,
+        "norm_ratio_dev_over_ref": 0.9970140281496725
+      },
+      {
+        "layer": 4,
+        "tokens": 1048576,
+        "state_pcc_vs_independent_fp32": 0.9999761446170149,
+        "rel_l2_err": 0.007469375599202725,
+        "norm_ratio_dev_over_ref": 0.9971333755278114
+      }
+    ],
+    "min_state_pcc": 0.9999682110958547,
+    "long_context_rows": [
+      {
+        "layer": 0,
+        "context": 1048576,
+        "first_call_golden_pcc": 0.9998510005981138,
+        "tail_chunk_pcc_vs_cpu_from_device_state": 0.9998537071318344,
+        "decode_pcc_vs_cpu_from_device_state": 0.9998945293453413,
+        "prefill_wall_s": 347.0746011734009
+      },
+      {
+        "layer": 1,
+        "context": 1048576,
+        "first_call_golden_pcc": 0.9999677430671792,
+        "tail_chunk_pcc_vs_cpu_from_device_state": 0.9999684026025151,
+        "decode_pcc_vs_cpu_from_device_state": 0.999980817695673,
+        "prefill_wall_s": 310.42938232421875
+      },
+      {
+        "layer": 4,
+        "context": 1048576,
+        "first_call_golden_pcc": 0.9996598206609872,
+        "tail_chunk_pcc_vs_cpu_from_device_state": 0.9998835328610869,
+        "decode_pcc_vs_cpu_from_device_state": 0.9999287148185667,
+        "prefill_wall_s": 2746.9569070339203
+      }
+    ],
+    "evidence": "doc/ttnn/01-functional-decoder/kda_drift.jsonl, doc/ttnn/01-functional-decoder/long_context.jsonl, doc/ttnn/01-functional-decoder/f1_investigation/",
+    "note": "The input cycles the golden 32K prompt, so the carried state settles into a periodic regime; the same protocol exposed the pre-fix drift (L1 state PCC 0.986 at 256K, norm ratio 0.947: doc/ttnn/01-functional-decoder/f1_investigation/kda_drift_composite_opdecay.jsonl), so it detects compounding error.",
+    "long_context_resume": "layer 4 ran with GLM53_LONG_RESUME_DIR (state checkpoint per 32K call; not needed in the final run: resumed_at_positions = []); resume reproduces an uninterrupted prefill bitwise (doc/ttnn/01-functional-decoder/resume_check.jsonl)"
+  },
+  "fused_decoder": {
+    "stage": "02-fused-decoder (tt/fused_decoder.py FusedDecoder; final code tt-metal 7a0f6087c2a)",
+    "context": "unchanged: dense_kda / sparse_kda 1,048,576 tokens, sparse_dsa 2051 (dense-exact regime, same guard); re-tested on the fused path: doc/ttnn/02-fused-decoder/long_context.jsonl (layers 0, 1, 4: 1,048,575-token streamed prefill + traced decode at 1,048,575) and kda_drift.jsonl (device states vs Stage 1's independent fp32 CPU states at 32K / 64K / 256K / 1M)",
+    "cache_dtype_and_layout": "MLA paged latent cache unchanged (bf16, same pages / page tables); KDA state re-laid-out into one [slots, 64, 128, 128] fp32 tensor + one [1, 3, slots, 24576] bf16 conv history (same bytes per slot)",
+    "max_kda_decode_slots": 32,
+    "max_kda_decode_slots_note": "enforced by FusedKDA.allocate_state: the batched conv history keeps the users as the rows of one tile ([1, 3, slots, 24576]); equal to Stage 1's max_tested_decode_batch (Stage 1's per-slot tensors have no explicit cap). KDA decode_forward takes exactly max_batch rows (every slot, inactive ones with cur_pos -1); MLA takes 1..max_batch.",
+    "max_tested_decode_batch": 32,
+    "tested_decode_batches": "1, 2, 3, 4, 5, 16, 17, 32 (doc/ttnn/02-fused-decoder/pcc_real_weights.jsonl test=batched_paged_decode, golden / follow-on decode at B=1)"
+  },
+  "full_model_generator": {
+    "stage": "06a-full-model-prep (host-only; tt/generator.py Glm53Generator over the ModelBackend seam; contract: $GLM53_WS/doc/ttnn/06a-full-model-prep/contract.md)",
+    "supported_context": "min over layer kinds (backend.supported_context: 2051 while sparse_dsa runs the dense-exact regime, 1048576 once the DSA sparse path lands) and the allocated max_seq_len; requests needing start + prompt + max_new_tokens - 1 positions beyond it raise ValueError at the public API; max_seq_len=None defaults to backend.supported_context only up to MAX_IMPLICIT_SEQ_LEN = 65536 (ValueError above it: pass max_seq_len explicitly)",
+    "prefill": {
+      "chunk_tokens": 2048,
+      "model_physical_alignment": 64,
+      "per_layer_rows": {
+        "kda": "round_up(n_valid, 32) (sliced from the 64-aligned chunk)",
+        "mla": "round_up(n_valid, 64)"
+      },
+      "logical_lengths": "any >= 1"
+    },
+    "decode_buckets": {
+      "widths": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        32
+      ],
+      "rule": "one decode trace per width below max_batch plus max_batch; a step replays the smallest width covering its decoding slots (slots 0..w-1); every width compiled before the first capture",
+      "attribute": "Glm53Generator.decode_buckets (= decode_widths(max_batch)); serving adapters (09a) pack live requests into the lowest slots when it is non-empty",
+      "source": "doc/DECISIONS.md 2026-10-17 ~22:15Z"
+    },
+    "slots": {
+      "max_decode_slots": 32,
+      "page_table": "one [slots, blocks_per_seq] table shared by the 11 MLA layers; caller rows set per-slot coverage; positions beyond it raise",
+      "inactive": "cur_pos -1 (unlisted slots untouched)",
+      "inactive_rows_backend_requirement": "rows with cur_pos == -1 inside a replayed width: the backend zeroes them at the layer boundary (at least MLA output / MoE router input and head input), keeps their router ids out of the fused_experts union and hands the sampler finite logits rows; the generator never consumes them (Stage 2 review C-9; DECISIONS 2026-10-17 ~19:45Z (c))",
+      "continuation": {
+        "kda": "from the slot's cache length only (no rewind)",
+        "mla": "start multiple of 64"
+      }
+    },
+    "token_feedback": "layer pipeline (1x8 line): embedding on chip 0, final norm + lm_head + sampler (models/common/sampling TTSampling, tt_out_tok) on the last chip; per-step D2H/H2D PCIe-socket hop captured inside the per-chip traces carries the sampled token from the last chip to chip 0's token input (DecodeIO.tokens); no Python per-token copy (doc/DECISIONS.md 2026-10-17 ~21:55Z/~22:15Z). Semantics: DecodeIO.sampled = last sampler step's tokens (the only token buffer the generator reads); DecodeIO.tokens = next step's input, holds step n's samples before step n+1 runs, and a host write between the two steps wins over the hop's value",
+    "sampling": {
+      "device": "models/common/sampling (SamplingGenerator/TTSampling), greedy = k1/p0/temp1 with lowest-id tie-break, top-k <= 32 candidates per vocab split (154880 -> 4 x 38720 on one chip)",
+      "host_compat": "explicit host_sampling=True only"
+    }
+  },
+  "stage_history": [
+    "03-optimized-decoder: OptimizedDecoder at 2ec09855d90 (capability unchanged; traced prefill added; the 2048 bucket and > 2048-token KDA traced prompts verified by test_prefill_trace_full_bucket)",
+    "04-multichip-decoder: 45-layer layer pipeline on the 2x4 mesh (pipeline8_ring_wrap); capability unchanged",
+    "06-full-model: Glm53PipelineBackend (tt/model.py) + Glm53Generator on the 8-chip pipeline; supported context unchanged (2051, DSA dense-exact, stage_scope_directive, not DRAM); full_model section added",
+    "07a-fused-streaming-layer: five decode glue chains as one generic_op program each (mhc_pre, kda_pre for <= 4 rows, router_tail, moe_post, kda_rec = recurrence + gated o norm for <= 2 rows), OptimizedDecoderConfig flags fused_* default ON 2026-10-19 (Stage 3 real-weight gates flags-on L0 / L3 / L4 pass, watcher clean per kind, W1c Tracy KPI); capability unchanged (decode rows <= 32 per program call, larger widths and prefill keep the op chain; fallback: set the fused_* flag False)",
+    "09-vllm: served through vLLM at max_model_len 2051 / 32 seqs on the 8-chip pipeline (capability unchanged)"
+  ],
+  "multichip_decoder": {
+    "stage": "04-multichip-decoder (tt/multichip_decoder.py MultichipDecoder; evidence $GLM53_WS/doc/ttnn/04-multichip-decoder/)",
+    "target_mesh": "host-8chip 2x4 Blackhole mesh (8 chips, 4 p300a), FABRIC_1D, mesh/glm8_2x4_mesh_graph_descriptor.textproto",
+    "strategy": "layer pipeline (partition.json pipeline8_ring_wrap): no tensor parallelism, so per-device KV cache, KDA state and weights are exactly the single-chip layer's, on the chip running that layer's attention (state) / sublayers (weights); nothing is replicated except the per-chip cur_pos and page-table copies",
+    "per_chip": [
+      {
+        "chip": 0,
+        "units": "embed .. L1.attn + L41.ffn .. norm+lm_head",
+        "kda_state_layers": [
+          0,
+          1,
+          42,
+          44
+        ],
+        "mla_cache_layers": [
+          43
+        ],
+        "weight_bytes_planned": 19587856430,
+        "state_bytes_32x2048_planned": 673260032,
+        "kv_latent_bytes_per_token_per_user": 1024,
+        "dsa_indexer_bytes_per_token_per_user": 256,
+        "kda_state_bytes_per_slot": 18417664,
+        "dram_allocated_bytes_measured_b32": 19518182912,
+        "dram_total_bytes": 33578683392,
+        "headroom_pct_measured": 41.1,
+        "max_context_tokens_b1_dram": 9307044
+      },
+      {
+        "chip": 2,
+        "units": "L1.ffn .. L7.ffn",
+        "kda_state_layers": [
+          2,
+          4,
+          5,
+          6
+        ],
+        "mla_cache_layers": [
+          3,
+          7
+        ],
+        "weight_bytes_planned": 22081870097,
+        "state_bytes_32x2048_planned": 757154816,
+        "kv_latent_bytes_per_token_per_user": 2048,
+        "dsa_indexer_bytes_per_token_per_user": 512,
+        "kda_state_bytes_per_slot": 18417664,
+        "dram_allocated_bytes_measured_b32": 24035008512,
+        "dram_total_bytes": 33578683392,
+        "headroom_pct_measured": 27.9,
+        "max_context_tokens_b1_dram": 2889137
+      },
+      {
+        "chip": 5,
+        "units": "L8.attn .. L13.attn",
+        "kda_state_layers": [
+          8,
+          9,
+          10,
+          12,
+          13
+        ],
+        "mla_cache_layers": [
+          11
+        ],
+        "weight_bytes_planned": 21727400240,
+        "state_bytes_32x2048_planned": 820601344,
+        "kv_latent_bytes_per_token_per_user": 1024,
+        "dsa_indexer_bytes_per_token_per_user": 256,
+        "kda_state_bytes_per_slot": 23022080,
+        "dram_allocated_bytes_measured_b32": 23951938560,
+        "dram_total_bytes": 33578683392,
+        "headroom_pct_measured": 28.2,
+        "max_context_tokens_b1_dram": 5843172
+      },
+      {
+        "chip": 6,
+        "units": "L13.ffn .. L19.attn",
+        "kda_state_layers": [
+          14,
+          16,
+          17,
+          18
+        ],
+        "mla_cache_layers": [
+          15,
+          19
+        ],
+        "weight_bytes_planned": 25898253317,
+        "state_bytes_32x2048_planned": 757154816,
+        "kv_latent_bytes_per_token_per_user": 2048,
+        "dsa_indexer_bytes_per_token_per_user": 512,
+        "kda_state_bytes_per_slot": 18417664,
+        "dram_allocated_bytes_measured_b32": 27831967744,
+        "dram_total_bytes": 33578683392,
+        "headroom_pct_measured": 16.8,
+        "max_context_tokens_b1_dram": 1405950
+      },
+      {
+        "chip": 7,
+        "units": "L19.ffn .. L24.ffn",
+        "kda_state_layers": [
+          20,
+          21,
+          22,
+          24
+        ],
+        "mla_cache_layers": [
+          23
+        ],
+        "weight_bytes_planned": 25686020282,
+        "state_bytes_32x2048_planned": 673260032,
+        "kv_latent_bytes_per_token_per_user": 1024,
+        "dsa_indexer_bytes_per_token_per_user": 256,
+        "kda_state_bytes_per_slot": 18417664,
+        "dram_allocated_bytes_measured_b32": 27589579264,
+        "dram_total_bytes": 33578683392,
+        "headroom_pct_measured": 17.5,
+        "max_context_tokens_b1_dram": 3001266
+      },
+      {
+        "chip": 4,
+        "units": "L25.attn .. L30.attn",
+        "kda_state_layers": [
+          25,
+          26,
+          28,
+          29,
+          30
+        ],
+        "mla_cache_layers": [
+          27
+        ],
+        "weight_bytes_planned": 21727400240,
+        "state_bytes_32x2048_planned": 820601344,
+        "kv_latent_bytes_per_token_per_user": 1024,
+        "dsa_indexer_bytes_per_token_per_user": 256,
+        "kda_state_bytes_per_slot": 23022080,
+        "dram_allocated_bytes_measured_b32": 23951922176,
+        "dram_total_bytes": 33578683392,
+        "headroom_pct_measured": 28.2,
+        "max_context_tokens_b1_dram": 5843185
+      },
+      {
+        "chip": 3,
+        "units": "L30.ffn .. L35.ffn",
+        "kda_state_layers": [
+          32,
+          33,
+          34
+        ],
+        "mla_cache_layers": [
+          31,
+          35
+        ],
+        "weight_bytes_planned": 25687517893,
+        "state_bytes_32x2048_planned": 609813504,
+        "kv_latent_bytes_per_token_per_user": 2048,
+        "dsa_indexer_bytes_per_token_per_user": 512,
+        "kda_state_bytes_per_slot": 13813248,
+        "dram_allocated_bytes_measured_b32": 27333499392,
+        "dram_total_bytes": 33578683392,
+        "headroom_pct_measured": 18.3,
+        "max_context_tokens_b1_dram": 1600664
+      },
+      {
+        "chip": 1,
+        "units": "L36.attn .. L41.attn",
+        "kda_state_layers": [
+          36,
+          37,
+          38,
+          40,
+          41
+        ],
+        "mla_cache_layers": [
+          39
+        ],
+        "weight_bytes_planned": 21727400240,
+        "state_bytes_32x2048_planned": 820601344,
+        "kv_latent_bytes_per_token_per_user": 1024,
+        "dsa_indexer_bytes_per_token_per_user": 256,
+        "kda_state_bytes_per_slot": 23022080,
+        "dram_allocated_bytes_measured_b32": 23951955968,
+        "dram_total_bytes": 33578683392,
+        "headroom_pct_measured": 28.2,
+        "max_context_tokens_b1_dram": 5843159
+      }
+    ],
+    "hf_advertised_context": 1048576,
+    "supported_context": 2051,
+    "supported_context_reason": "unchanged: sparse_dsa dense-exact bound (stage_scope_directive, capability_reduction) — not a multichip / DRAM limit",
+    "dram_max_context_tokens_b1": 1405950,
+    "dram_max_context_note": "largest per-user context the measured free DRAM of the tightest MLA chip holds at B=1 (free - 2 GiB reserve) / ((1 KiB latent + 256 B DSA indexer keys) x MLA layers on the chip); the B=32 x 2048 caches are already allocated in the measured footprint. The pipeline does not reduce the advertised context: DRAM would hold ~10^6 tokens for one user once the DSA sparse path lifts the 2051 bound",
+    "serving_target_first_release": 2048,
+    "max_decode_slots": 32,
+    "prefill": {
+      "logical_lengths": "any >= 1 (default chunk policy 'plan': plan_traced_chunks(len, 64, buckets) = full power-of-two chunks + one tail < 64 tokens; KDA layers run the tail at round_up(n, 32) rows, MLA at 64; padded rows zeroed at every unit boundary)",
+      "chunk_policy": "prefill_forward(chunk_policy='plan') is the default and the device-accepted path; 'auto' / 'padded' (one padded remainder chunk) are opt-in, allowed only when the chunk pads < 32 rows, and that guard (a4355c0ca56) is host-validated only (not device-validated)",
+      "kda_padding_rule": "a prefill chunk must never hold a fully padded 32-row KDA recurrence chunk: prepare_chunk_recurrence skips it and leaves its terms unwritten while the scan still adds them to the state -> wrong KDA state handed to decode (Stage 4 v2 post_prefill_state rows; Stage 6 run 3 end-to-end). Fix (state kept across a dead chunk, 90a58532246) device-validated 2026-10-19 02:18Z on one chip and merged (48a1608e8a8); the plan default and the < 32-row guard stay until Stage 6 re-validates 'auto'",
+      "continuation": "start_pos multiple of 64 (MLA page); KDA continues from the slot's state",
+      "buckets": [
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048
+      ],
+      "traced": "one trace per (stage, unit, bucket) on per-chip shared ping-pong buffers (2 x 4064 rows x 64 KiB = 508 MiB per chip); chunks flow chip to chip through eager socket transfers"
+    },
+    "decode": {
+      "traces": "one per (stage, micro-batch group) = per chip (two on chip 0: head + tail); width = the group's max_batch slots (06a's pow2 width traces need the KDA slot-prefix view: Stage 6)",
+      "positions": "cur_pos [slots] int32 per stage, advanced in-trace by ttnn.plus_one(skip_negative_entries)",
+      "page_table": "one [slots, blocks_per_seq] int32 per stage holding MLA layers, shared by them, rewritten in place",
+      "handoff": "send/recv_direct_async inside the per-chip traces, 2 MiB [1,1,B,16384] fp32 per hop, 8 hops per step"
+    },
+    "trace_region_bytes_per_chip": 600000000,
+    "derived_weight_cache": {
+      "env": "GLM53_FUSED_EXPERTS_CACHE",
+      "location": "/opt/glm53/tt-cache/glm53-flash-fused-perm (NFS, next to the tile cache)",
+      "content": "fused_experts permuted gate|up copy of every routed expert (byte-exact tile permutation of the tile cache, written on first load): ~2.7 GB per MoE layer, ~114 GB for the 42 MoE layers",
+      "decision": "program APPROVED 2026-10-18T21:11Z: does not fit host-8chip's local disk (the first 8-chip run filled / at 07:58Z with the local default); Stage 6 inherits it. Pre-generate host-only with doc/ttnn/04-multichip-decoder/scripts/prewarm_fused_perm.py"
+    }
+  },
+  "full_model": {
+    "stage": "06-full-model (tt/model.py Glm53PipelineBackend + tt/generator.py Glm53Generator on the Stage 4 layer pipeline pipeline8_ring_wrap, 8 Blackhole chips; evidence $GLM53_WS/doc/ttnn/06-full-model/)",
+    "hf_advertised_context": 1048576,
+    "supported_context": 2051,
+    "supported_context_reason": "min over layer kinds: sparse_dsa (MLA/DSA) runs the dense-exact regime kv_len <= 2051 (capability_reduction: reduction_reason stage_scope_directive); the DSA sparse > 2051 path is not built (deferred to Stage 5/7 by DECISIONS 2026-10-17 ~20:45Z; first serve max_model_len 2048; program waiver doc/ttnn/06-full-model/WAIVERS.md context_gate). Not a DRAM limit (dram_capacity below).",
+    "public_api_bound": "Glm53Generator.check_context: start_pos + prompt_len + max_new_tokens - 1 <= 2051 for every public path (ValueError naming both numbers); prompt lengths 1..2051 accepted, non-aligned included",
+    "dram_capacity": {
+      "method": "measured allocator view of every chip after the full model's warmup + every trace capture (batch 1, max_seq_len 2051): weights of the chip's layers, KDA state, MLA latent pages, page tables, per-stage positions, stack / prefill ping-pong buffers, chip-0 terminal (embedding 1.27 GB, lm_head 0.68 GB, logits, samplers), trace region 800 MB (outside the allocator's total). Free bytes after a 1 GiB reserve / (MLA layers on the chip x (1024 B latent + 64 B DSA pooled keys) per token) = batch-1 tokens that fit.",
+      "evidence": "doc/ttnn/06-full-model/context_capacity_run1.json (run 20261018T225947Z, tests.jsonl full_model/warmup dram_per_chip)",
+      "per_chip": {
+        "0": {
+          "allocated": 20329089024,
+          "total": 33378667520,
+          "free_after_reserve": 11975836672,
+          "mla_layers": [
+            43
+          ],
+          "bytes_per_token_batch1": 1088,
+          "batch1_tokens_fit": 11007202
+        },
+        "2": {
+          "allocated": 22789614592,
+          "total": 33378667520,
+          "free_after_reserve": 9515311104,
+          "mla_layers": [
+            3,
+            7
+          ],
+          "bytes_per_token_batch1": 2176,
+          "batch1_tokens_fit": 4372845
+        },
+        "5": {
+          "allocated": 22518734848,
+          "total": 33378667520,
+          "free_after_reserve": 9786190848,
+          "mla_layers": [
+            11
+          ],
+          "bytes_per_token_batch1": 1088,
+          "batch1_tokens_fit": 8994660
+        },
+        "6": {
+          "allocated": 26586639360,
+          "total": 33378667520,
+          "free_after_reserve": 5718286336,
+          "mla_layers": [
+            15,
+            19
+          ],
+          "bytes_per_token_batch1": 2176,
+          "batch1_tokens_fit": 2627888
+        },
+        "7": {
+          "allocated": 26425515520,
+          "total": 33378667520,
+          "free_after_reserve": 5879410176,
+          "mla_layers": [
+            23
+          ],
+          "bytes_per_token_batch1": 1088,
+          "batch1_tokens_fit": 5403869
+        },
+        "4": {
+          "allocated": 22518734848,
+          "total": 33378667520,
+          "free_after_reserve": 9786190848,
+          "mla_layers": [
+            27
+          ],
+          "bytes_per_token_batch1": 1088,
+          "batch1_tokens_fit": 8994660
+        },
+        "3": {
+          "allocated": 26357130752,
+          "total": 33378667520,
+          "free_after_reserve": 5947794944,
+          "mla_layers": [
+            31,
+            35
+          ],
+          "bytes_per_token_batch1": 2176,
+          "batch1_tokens_fit": 2733361
+        },
+        "1": {
+          "allocated": 22518734848,
+          "total": 33378667520,
+          "free_after_reserve": 9786190848,
+          "mla_layers": [
+            39
+          ],
+          "bytes_per_token_batch1": 1088,
+          "batch1_tokens_fit": 8994660
+        }
+      },
+      "dram_limited_batch1_context": 2627888,
+      "limiting_chip": "6",
+      "conclusion": "batch 1 fits 2,627,888 tokens on the most constrained chip (>= the advertised 1,048,576): device DRAM does not limit the advertised context at batch 1; at batch B the per-user context is bounded by ~2,627,888 / B tokens on that chip (batch x context product), e.g. B=32 -> ~82,121 tokens per user."
+    },
+    "batch": {
+      "primary": "batch 1 (max_batch=1: one decode trace width)",
+      "max_tested_decode_batch": 32,
+      "evidence": "doc/ttnn/06-full-model/tests.jsonl run 20261019T012205Z: full_model/batch32_mixed (32 mixed-length users in fixed slots, early finishers -> inactive rows, duplicates identical), full_model/batch32_paused_slot, full_model/tf_decode_sweep/b32_*, full_model/serving_pool_paging (max_batch 4, 64-block pool)",
+      "decode_widths": "every width of Glm53Generator.decode_buckets maps to the full-width pipeline decode trace (KDA decodes every slot of its batched state); rows outside the live set carry cur_pos -1 and are untouched"
+    },
+    "token_feedback": "wrap plan: embedding, final norm, lm_head and the sampler all on chip 0; the sampler trace writes the sampled token directly into the next decode step's token input (tt_out_tok = DecodeIO.tokens) and copies it to DecodeIO.sampled (the buffer the generator reads); no D2H/H2D hop is needed (06a's line-plan socket hop superseded by the wrap plan; semantics of DecodeIO.tokens / sampled unchanged)",
+    "trace_lifetime": "per KV cache: 9 per-chip decode traces (head stage incl. embedding, tail stage incl. head), 2 sampler traces (greedy / sample), prefill traces per (stage, unit, bucket); captured once in warmup phase 2, retained until teardown; TT_METAL_TRACE_ALLOC_TRACKING=1 runs clean (runs 20261018T232823Z, 20261019T012205Z; final code: run A of maintenance #2)"
+  },
+  "vllm_serving": {
+    "stage": "09-vllm (vLLM 0.26.0 + vllm-tt-plugin glm53-flash 9f41d19; adapter tt/generator_vllm.py:Glm5NextForCausalLM; doc/vllm_integration/README.md)",
+    "served_max_model_len": 2051,
+    "served_max_model_len_note": "= current_supported_context (the MLA/DSA dense-exact bound, stage_scope_directive); vLLM refuses a prompt + max_tokens above it with HTTP 400; async look-ahead stays inside it (the last scheduled decode position is 2050). Not a hard physical limit: lifted with the DSA sparse path (capability_reduction.lifted_by).",
+    "max_num_seqs": 32,
+    "block_size": 64,
+    "kv_pool_blocks_at_32x2051": 1058,
+    "kv_cache_dtype": "bfloat16 MLA latent (vLLM MLAAttentionSpec per MLA layer, 1024 B/token/layer); KDA state model-owned per slot",
+    "evidence": "$GLM53_WS/doc/ttnn/09-vllm/serve_runs/serve1/checks.jsonl (edge/*: 2052-token prompt -> 400, 2000+51 completes, 2000+52 -> 400, 2050+1 completes)"
+  }
+}

@@ -121,7 +121,12 @@ void bind_sdpa_decode(nb::module_& mod) {
         // b*Tg+j attends to [0, cur_pos[b*Tg+j]] inclusive. Output is [1, B, Tg*32, DH] —
         // byte-identical to the legacy B*Tg-row output [1, B*Tg, 32, DH]. Requires causal +
         // paged + num_kv_heads==1, unsharded bf16 TILE Q, no sliding window, no MLA.
-        nb::arg("spec_multi_pos_tiles") = 0u);
+        nb::arg("spec_multi_pos_tiles") = 0u,
+        // Fused KV append: the current token's K/V heads ([1, B, n_kv_heads, D] bf16, height sharded one
+        // user per core, as paged_update_cache takes them). The kernel inserts them into the cache tile at
+        // cur_pos before attending and writes the tile back, replacing the separate cache-update op.
+        nb::arg("k_new") = nb::none(),
+        nb::arg("v_new") = nb::none());
 
     ttnn::bind_function<"flash_multi_latent_attention_decode", "ttnn.transformer.">(
         mod,

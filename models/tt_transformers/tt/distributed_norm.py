@@ -133,7 +133,11 @@ class DistributedNorm(LightweightModule):
         input_mem_cfg = sharded_output_config if mode == Mode.DECODE else ttnn.DRAM_MEMORY_CONFIG
 
         # Distributed norm already performs a gather
-        if self.args.is_multichip and not self.args.is_distributed_norm(mode):
+        if (
+            self.args.is_multichip
+            and not self.args.is_distributed_norm(mode)
+            and getattr(self.tt_ccl, "pcie", None) is None
+        ):
             x = ttnn.experimental.all_gather_async(
                 x,
                 persistent_output_buffer=None,
@@ -166,8 +170,12 @@ class DistributedNorm(LightweightModule):
                 norm_config=norm_config,
             )
 
-        # Distributed norm requires a gather
-        if self.args.is_distributed_norm(mode) and self.enable_all_gather:
+        # Distributed norm requires a gather (not on the PCIe P2P mesh: the norm ran on the replicated input)
+        if (
+            self.args.is_distributed_norm(mode)
+            and self.enable_all_gather
+            and getattr(self.tt_ccl, "pcie", None) is None
+        ):
             x = ttnn.experimental.all_gather_async(
                 x,
                 persistent_output_buffer=None,

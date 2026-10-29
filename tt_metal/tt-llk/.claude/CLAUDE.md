@@ -34,7 +34,7 @@ Execution model: RISC-V cores push instructions to corresponding coprocessor thr
 
 **MANDATORY**: Before dispatching agents or taking action for the triggers below, you MUST first invoke the corresponding skill (or `Read` its `SKILL.md`) and follow the instructions inside it. Never manually dispatch sage agents without first loading the relevant skill — the skill defines the correct orchestration pattern, prompt structure, and quality checklist.
 
-**Note:** Skills live in `.claude/skills/<name>/SKILL.md` relative to this file. Claude Code auto-discovers them when launched from inside `tt-llk/` (nested-subdirectory discovery). If the `Skill` tool doesn't list them, fall back to `Read(".claude/skills/<name>/SKILL.md")`.
+**Note:** Skills live in `.claude/skills/<name>/SKILL.md` relative to this file. the program auto-discovers them when launched from inside `tt-llk/` (nested-subdirectory discovery). If the `Skill` tool doesn't list them, fall back to `Read(".claude/skills/<name>/SKILL.md")`.
 
 | Trigger | Skill | What it does |
 |---------|-------|--------------|

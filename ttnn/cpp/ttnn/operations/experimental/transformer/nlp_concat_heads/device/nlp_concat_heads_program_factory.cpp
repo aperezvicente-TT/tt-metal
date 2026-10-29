@@ -2,6 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+#include <algorithm>
+
 #include <tt-metalium/host_api.hpp>
 #include <tt-metalium/constants.hpp>
 #include <tt-metalium/experimental/metal2_host_api/program_run_args.hpp>
@@ -207,6 +209,12 @@ ttnn::device_operation::ProgramArtifacts NLPConcatHeadsProgramFactory::create_pr
     uint32_t in0_dfb_num_entries = per_tensor_tiles;
     if (!in_sharded) {
         in0_dfb_num_entries *= 2;  // double buffer
+        // The interleaved reader reserves one head's tile row (in0_w_tiles) per (row, head) block and the writer
+        // drains one tile at a time, so 4 blocks in flight suffice. A double-buffered row of every head (32 heads x 256
+        // wide = 1 MB) filled L1 past co-resident L1 buffers.
+        if (!out_sharded) {
+            in0_dfb_num_entries = std::min(in0_dfb_num_entries, 4 * in0_w_tiles);
+        }
     }
     Group<DataflowBufferSpec> dataflow_buffers;
     dataflow_buffers.push_back(DataflowBufferSpec{

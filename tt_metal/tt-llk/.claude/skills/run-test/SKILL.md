@@ -6,7 +6,7 @@ user_invocable: true
 
 # /run-test — Run LLK Tests
 
-Wraps `.claude/scripts/run_test.sh`, which serialises simulator access (flock), sets `TT_UMD_SIMULATOR_PATH`, and exposes `count` / `compile` / `simulate` / `run` subcommands. Agents and Claude must never call `pytest` directly.
+Wraps `.claude/scripts/run_test.sh`, which serialises simulator access (flock), sets `TT_UMD_SIMULATOR_PATH`, and exposes `count` / `compile` / `simulate` / `run` subcommands. Agents and the program must never call `pytest` directly.
 
 ## Usage
 

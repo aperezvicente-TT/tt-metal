@@ -110,7 +110,9 @@ ttnn::Tensor paged_scaled_dot_product_attention_decode(
     std::optional<DeviceComputeKernelConfig> compute_kernel_config,
     std::optional<ttnn::operations::transformer::PagedCacheGeometryOverride> paged_cache_geometry,
     std::optional<uint32_t> cache_position_modulo,
-    uint32_t spec_multi_pos_tiles) {
+    uint32_t spec_multi_pos_tiles,
+    const std::optional<const Tensor>& k_new,
+    const std::optional<const Tensor>& v_new) {
     if (!program_config.has_value()) {
         program_config = ttnn::operations::transformer::SDPAProgramConfig{
             input_tensor_q.device()->compute_with_storage_grid_size(),
@@ -169,7 +171,9 @@ ttnn::Tensor paged_scaled_dot_product_attention_decode(
         std::nullopt,
         paged_cache_geometry,
         cache_position_modulo,
-        spec_multi_pos_tiles);
+        spec_multi_pos_tiles,
+        k_new,
+        v_new);
 }
 
 ttnn::Tensor flash_multi_latent_attention_decode(

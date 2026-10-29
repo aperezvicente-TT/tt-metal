@@ -218,13 +218,27 @@ SparseSDPAOperation::spec_return_value_t SparseSDPAOperation::compute_output_spe
     // noc writes, so no caller-supplied memory_config is exposed (it could only ever be this).
     const tt::tt_metal::MemoryConfig out_mem{
         tt::tt_metal::TensorMemoryLayout::INTERLEAVED, tt::tt_metal::BufferType::DRAM};
-    return tt::tt_metal::TensorSpec(
+    std::vector<tt::tt_metal::TensorSpec> specs;
+    specs.emplace_back(
         shape, tt::tt_metal::TensorLayout(t.q.dtype(), tt::tt_metal::PageConfig(Layout::ROW_MAJOR), out_mem));
+    if (attrs.emit_stats) {
+        // the split-K statistics: one ROW_MAJOR fp32 page per token, [m_0 .. m_H-1, l_0 .. l_H-1] (2 H floats:
+        // a multiple of the DRAM alignment for every H that is a multiple of 8 -- H is a multiple of 32)
+        const ttnn::Shape stats_shape({1, 1, t.q.logical_shape()[2], 2 * t.q.logical_shape()[1]});
+        specs.emplace_back(
+            stats_shape,
+            tt::tt_metal::TensorLayout(DataType::FLOAT32, tt::tt_metal::PageConfig(Layout::ROW_MAJOR), out_mem));
+    }
+    return specs;
 }
 
 SparseSDPAOperation::tensor_return_value_t SparseSDPAOperation::create_output_tensors(
     const SparseSDPAParams& attrs, const SparseSDPAInputs& t) {
-    return create_device_tensor(compute_output_specs(attrs, t), t.q.device());
+    std::vector<Tensor> out;
+    for (const auto& spec : compute_output_specs(attrs, t)) {
+        out.push_back(create_device_tensor(spec, t.q.device()));
+    }
+    return out;
 }
 
 ttsl::hash::hash_t SparseSDPAOperation::compute_program_hash(const SparseSDPAParams& attrs, const SparseSDPAInputs& t) {
@@ -267,10 +281,12 @@ ttsl::hash::hash_t SparseSDPAOperation::compute_program_hash(const SparseSDPAPar
         attrs.block_cyclic.has_value() ? attrs.block_cyclic->chunk_local : 0u,
         t.indices.logical_shape(),
         t.indices.dtype(),
-        t.attention_sink);
+        t.attention_sink,
+        // emit_stats: a second output + the stats CBs / args (the kernels' compile-time EMIT_STATS)
+        attrs.emit_stats);
 }
 
-Tensor sparse_sdpa(
+std::vector<Tensor> sparse_sdpa(
     const Tensor& q,
     const Tensor& kv,
     const Tensor& indices,
@@ -281,7 +297,8 @@ Tensor sparse_sdpa(
     ttnn::DeviceComputeKernelConfig compute_kernel_config,
     std::optional<uint32_t> cache_batch_idx,
     std::optional<BlockCyclicLayout> block_cyclic,
-    const std::optional<Tensor>& attention_sink) {
+    const std::optional<Tensor>& attention_sink,
+    bool emit_stats) {
     using OperationType = ttnn::prim::SparseSDPAOperation;
     return ttnn::device_operation::launch<OperationType>(
         OperationType::operation_attributes_t{
@@ -292,6 +309,7 @@ Tensor sparse_sdpa(
             .compute_kernel_config = compute_kernel_config,
             .cache_batch_idx = cache_batch_idx,
             .block_cyclic = block_cyclic,
+            .emit_stats = emit_stats,
         },
         OperationType::tensor_args_t{
             .q = q,

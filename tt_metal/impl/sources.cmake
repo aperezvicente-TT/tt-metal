@@ -1,6 +1,7 @@
 set(IMPL_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/experimental/core_subset_write/mesh_command_queue.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/experimental/core_subset_write/tensor.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/experimental/pcie_p2p/pcie_p2p.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/internal/disaggregation/kv_chunk_address_table.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/internal/disaggregation/kv_chunk_table_cache.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/internal/disaggregation/umd_dram_reader.cpp
@@ -51,6 +52,7 @@ set(IMPL_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/data_format/bfloat2.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/data_format/bfloat4.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/data_format/bfloat8.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/data_format/bfp_fast_pack.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/data_format/bfloat16.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/data_format/bfloat16_utils.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/data_format/blockfloat_common.cpp

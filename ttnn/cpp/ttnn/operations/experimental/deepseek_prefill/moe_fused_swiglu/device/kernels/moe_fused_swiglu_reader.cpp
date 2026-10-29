@@ -5,7 +5,7 @@
 //
 // Per M-block, in order:
 //   0. the device-resident token count (idx -> counts[idx[local_expert_id]]), published to the L1
-//      mailbox every other kernel spins on;
+//      mailbox every other kernel spins on (MOE_GATHER_X: then the expert's x_row_index slice);
 //   1a. stage this core's `x` tile-rows from DRAM, then ROW-multicast them along grid row y
 //      (rotating injector, one tile-row per round) via mcast_pipe. W_gate is issued here too;
 //   1b. publish the W_gate stream chunk by chunk (W_up is the writer's twin on NoC1);
@@ -261,7 +261,10 @@ inline void h_slot_send_posted(uint32_t slot, uint32_t l1, uint32_t size, bool g
     // 3. the flag — NON-POSTED, on the same VC, terminating the link. This is the arrival proof.
     hf.set_multicast(noc, rb.sx, rb.sy, rb.ex, rb.ey, ndest, /*linked=*/false);
     // 4. SENT, so the flag cell is safe to rewrite; 5. rotating-sender reset.
-    noc.async_writes_flushed();
+    // the NIU has READ the flag cell, not just sent the request (a plain flush): resetting it below
+    // could otherwise multicast INVALID and strand every receiver -- the rare soak hang (Stage 16,
+    // 2026-10-21); as kernel_lib mcast_pipe.inl's rotating Flag sender
+    noc.async_writes_flushed<NocOptions::TXN_ID>({.trid = 0});
     hf.set(INVALID);
 }
 
@@ -291,11 +294,41 @@ constexpr auto down_bias_args = TensorAccessorArgs<up_bias_args.next_compile_tim
 constexpr uint32_t COMMON_BIAS = COMMON_HMCAST + 4 + 2 * HGROUPS * KGROUPS;
 #endif
 
+#ifdef MOE_GATHER_X
+// GATHERED x READ (x_row_index). Dispatch row d of an expert's region reads its activation stick from input row
+// x_row_index[d] instead of row d, so the host can hand this op the UNDISPATCHED token rows and drop the dispatch
+// gather. CB id, clamp bound, page size, then the accessor -- appended after the bias block (or after `start`)
+// so no offset above moved; the table's base is the LAST common argument for the same reason.
+#ifdef FUSE_BIAS
+constexpr uint32_t GATHER_CT_OFFSET = down_bias_args.next_compile_time_args_offset();
+constexpr uint32_t COMMON_X_ROW_INDEX = COMMON_BIAS + 3 * EXPERTS_PER_CHIP;
+#else
+constexpr uint32_t GATHER_CT_OFFSET = start_args.next_compile_time_args_offset();
+constexpr uint32_t COMMON_X_ROW_INDEX = COMMON_HMCAST + 4 + 2 * HGROUPS * KGROUPS;
+#endif
+constexpr uint32_t cb_x_row_index = get_compile_time_arg_val(GATHER_CT_OFFSET + 0);
+// Activation rows. The table is device data the host cannot bound, so every gathered id is clamped to the last
+// row: a bad id reads a wrong-but-allocated stick, never DRAM outside the activation tensor.
+constexpr uint32_t X_ROWS = get_compile_time_arg_val(GATHER_CT_OFFSET + 1);
+constexpr uint32_t X_ROW_INDEX_PAGE = get_compile_time_arg_val(GATHER_CT_OFFSET + 2);
+constexpr auto x_row_index_args = TensorAccessorArgs<GATHER_CT_OFFSET + 3>();
+constexpr uint32_t X_ROW_ID_BYTES = sizeof(uint32_t);
+// Only the bf16 stick path is addressed per token row; a bfp8 tile packs 32 rows and cannot be gathered.
+static_assert(INPUT_FORMAT == 0, "MOE_GATHER_X requires BF16 ROW_MAJOR activations");
+// The table slice is fetched at the region base, which exists only in the shared-buffer region mode.
+static_assert(READ_X_AT_OFFSET != 0 && NEED_START != 0, "MOE_GATHER_X requires read_x_at_offset");
+static_assert(X_ROWS > 0, "MOE_GATHER_X needs at least one activation row");
+#endif
+
 // Three `WeightRuns` bindings, because the three tensors this kernel touches can have DIFFERENT
 // placements: each weight stream takes its own tensor's DRAM ND shard width (0 = interleaved,
 // one transaction per tile), and everything else stays on the interleaved binding.
 using BR = moe_fused_swiglu::WeightRuns<>;
+#ifdef MOE_GU_INTERLEAVED
+using BRG = moe_fused_swiglu::InterleavedRuns<0>;  // W_gate = the even tile columns of the gate|up tensor
+#else
 using BRG = moe_fused_swiglu::WeightRuns<WG_SHARD_W>;  // W_gate
+#endif
 using BRD = moe_fused_swiglu::WeightRuns<WD_SHARD_W>;  // W_down
 
 // The W_down NoC split: WD_SPLIT eighths of every phase-2 K-block's hidden rows are read by the
@@ -343,6 +376,14 @@ void kernel_main() {
     const auto cnt_acc = TensorAccessor(cnt_args, counts_addr, COUNTS_PAGE);
     const auto idx_acc = TensorAccessor(idx_args, idx_addr, IDX_PAGE);
     const auto start_acc = TensorAccessor(start_args, start_addr, START_PAGE);
+#ifdef MOE_GATHER_X
+    const auto x_row_index_acc =
+        TensorAccessor(x_row_index_args, get_common_arg_val<uint32_t>(COMMON_X_ROW_INDEX), X_ROW_INDEX_PAGE);
+    // One never-reserved, never-pushed page, so this write pointer is its base for the whole kernel and every
+    // expert refills the same words -- like the idx / counts scratch pages.
+    const uint32_t x_row_ids_addr = get_write_ptr(cb_x_row_index);
+    volatile tt_l1_ptr uint32_t* const x_row_ids = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(x_row_ids_addr);
+#endif
     const uint32_t wd_base = get_write_ptr(cb_w_down);
 
     // The compute and writer mailbox CBs have independent FIFO state but alias CB_X_STAGE's 64 B
@@ -424,6 +465,22 @@ void kernel_main() {
     // reset and the writer derives the identical value from the same per-expert m_blocks.
     // `block_idx` stays expert-relative — it selects token rows and the residency gate.
     uint32_t gb = 0;
+    // The routing tables (local -> global expert id, per-expert counts, region starts) are device data written before
+    // this op and constant during it: read them ONCE (three reads, one barrier) instead of three serial round trips
+    // per expert (288 experts per call under XSL). The starts live in the counts scratch's second, 64-B-aligned page.
+    const uint32_t l1_idx = get_write_ptr(cb_idx_scratch);
+    const uint32_t l1_cnt = get_write_ptr(cb_counts_scratch);
+    constexpr uint32_t COUNTS_PAGE_ALIGNED = (COUNTS_PAGE + 63) / 64 * 64;
+    const uint32_t l1_start = l1_cnt + COUNTS_PAGE_ALIGNED;
+    noc.async_read(idx_acc, CoreLocalMem<uint32_t>(l1_idx), IDX_PAGE, {.page_id = 0}, {});
+    noc.async_read(cnt_acc, CoreLocalMem<uint32_t>(l1_cnt), COUNTS_PAGE, {.page_id = 0}, {});
+    if constexpr (NEED_START) {
+        static_assert(START_PAGE <= COUNTS_PAGE_ALIGNED, "the starts page must fit the counts scratch's second page");
+        noc.async_read(start_acc, CoreLocalMem<uint32_t>(l1_start), START_PAGE, {.page_id = 0}, {});
+    }
+    noc.async_read_barrier();
+    invalidate_l1_cache();
+
     for (uint32_t local_expert_id = 0; local_expert_id < EXPERTS_PER_CHIP; ++local_expert_id) {
         const auto wg_acc =
             TensorAccessor(wg_args, get_common_arg_val<uint32_t>(COMMON_WEIGHTS + local_expert_id), W_TILE);
@@ -487,18 +544,8 @@ void kernel_main() {
             cb_push_back(cb_down_bias, EC_MAX);
         }
 #endif
-        // Phase 0 — this expert's device-resident count. count = counts[ idx[local_expert_id] ].
-        // Two one-page reads into unpushed scratch CBs, read back through a volatile L1 pointer.
-        const uint32_t l1_idx = get_write_ptr(cb_idx_scratch);
-        const uint32_t l1_cnt = get_write_ptr(cb_counts_scratch);
-        // Both accessors fetch page zero into distinct scratch pages.  Only the L1 lookup below
-        // depends on `global_expert_id`; the counts PAGE address does not, so issue the two independent DRAM reads
-        // together and pay one completion round-trip.  The optional region-start read remains later:
-        // it deliberately reuses l1_cnt after `count` is extracted.
-        noc.async_read(idx_acc, CoreLocalMem<uint32_t>(l1_idx), IDX_PAGE, {.page_id = 0}, {});
-        noc.async_read(cnt_acc, CoreLocalMem<uint32_t>(l1_cnt), COUNTS_PAGE, {.page_id = 0}, {});
-        noc.async_read_barrier();
-        invalidate_l1_cache();
+        // Phase 0 — this expert's device-resident count. count = counts[ idx[local_expert_id] ], looked up in the
+        // tables read once before the expert loop (volatile L1 reads).
         const uint32_t global_expert_id = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1_idx)[local_expert_id];
         // The routing table lives on device, so the host can size it but never bound its VALUES. An
         // id past the counts tensor indexes outside the scratch page, which would turn whatever L1
@@ -516,19 +563,13 @@ void kernel_main() {
             m_t = M_T_MAX;
         }
 
-        // This expert's REGION BASE in a shared buffer, in token rows. Reuses cb_counts_scratch's page,
-        // dead once the count is extracted and exactly the right size (host validates equal lengths), so
-        // the fused mode costs zero extra L1. Read ahead of the M-block derivations, not after, so a
-        // rejected region can zero the count they are built from.
+        // This expert's REGION BASE in a shared buffer, in token rows (the starts page read before the loop). Looked
+        // up ahead of the M-block derivations, not after, so a rejected region can zero the count they are built from.
         uint32_t start_row = 0;
         bool region_ok = true;
         if constexpr (NEED_START) {
             // Same bound as the count: this lookup is the one that becomes the writer's NOC base.
             if (expert_in_range) {
-                const uint32_t l1_start = get_write_ptr(cb_counts_scratch);
-                noc.async_read(start_acc, CoreLocalMem<uint32_t>(l1_start), START_PAGE, {.page_id = 0}, {});
-                noc.async_read_barrier();
-                invalidate_l1_cache();
                 start_row = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(l1_start)[global_expert_id];
                 // The offsets are device-produced too, so the host sizes the table and cannot bound
                 // what it holds. This value becomes the x read base below and, through the mailbox,
@@ -566,6 +607,26 @@ void kernel_main() {
             mailbox_addr, MAILBOX_MAGIC + local_expert_id, count, m_t, m_blocks, start_row);
         cb_push_back(cb_mailbox_compute, 1);
         cb_push_back(cb_mailbox_writer, 1);
+#ifdef MOE_GATHER_X
+        // GATHER_X: this expert's slice of the dispatch-row -> input-row table, x_row_index[start_row ..
+        // start_row + m_t * TILE_H), lands before the expert's first issue_x_row. ONE read: start_row passed the
+        // region check (tile-aligned, region inside the table), so the source offset is a multiple of 128 B --
+        // DRAM-aligned on every arch -- and m_t <= M_T_MAX is exactly what the scratch page holds. Issued after
+        // the mailbox publish so compute and the writer enter the expert while it lands. Nothing else is in
+        // flight here (phase 0's own reads were drained above), so this barrier waits on this read alone.
+        // Rows past m_t (an m_eff round-up, or the M_T_MAX clamp) keep stale ids: their output rows are never
+        // written, and issue_x_row's clamp keeps their reads inside the activation tensor.
+        if (m_t != 0) {
+            noc.async_read(
+                x_row_index_acc,
+                CoreLocalMem<uint32_t>(x_row_ids_addr),
+                m_t * TILE_H * X_ROW_ID_BYTES,
+                {.page_id = 0, .offset_bytes = start_row * X_ROW_ID_BYTES},
+                {});
+            noc.async_read_barrier();
+            invalidate_l1_cache();
+        }
+#endif
         // x-read rebase, derived once. Row-major x is addressed by STICK (one page per token row), so
         // the offset is the token row itself; tiled x is addressed by TILE PAGE at an EMB_T row stride.
         const uint32_t x_stick_base = READ_X_AT_OFFSET ? start_row : 0;
@@ -577,16 +638,27 @@ void kernel_main() {
         //
         // THE ONE PLACE x MEETS DRAM, which is why the fused extract is two additions and nothing else:
         // `row` is REGION-RELATIVE (callers clamp against M_T_MAX, so clamp-then-rebase composes) and
-        // the base moves the read into this expert's slice.
+        // the base moves the read into this expert's slice. GATHER_X swaps the rebase for a lookup: the
+        // region-relative dispatch row indexes this expert's x_row_index slice (fetched in phase 0) and the
+        // stick comes from the input row it names. Both prologue and cross-block prefetch reads land here.
         auto issue_x_row = [&](uint32_t row, uint32_t dst) {
             if constexpr (INPUT_FORMAT == 0) {
                 for (uint32_t i = 0; i < TILE_H; ++i) {
                     const uint32_t s = (i + my_col + my_row) % TILE_H;
+#ifdef MOE_GATHER_X
+                    const uint32_t src_row = x_row_ids[row * TILE_H + s];
+                    // Loud under --dev for a fetched (row < m_t) id, silent-but-safe otherwise; rows past m_t
+                    // read stale ids by design (see phase 0), so only the clamp applies to them.
+                    ASSERT(row >= m_t || src_row < X_ROWS);
+                    const uint32_t stick_page = (src_row < X_ROWS) ? src_row : (X_ROWS - 1);
+#else
+                    const uint32_t stick_page = x_stick_base + row * TILE_H + s;
+#endif
                     noc.async_read(
                         x_acc,
                         CoreLocalMem<uint32_t>(dst + s * X_SLICE),
                         kr_rows * BF16_TILE_ROW_BYTES,
-                        {.page_id = x_stick_base + row * TILE_H + s, .offset_bytes = kstart * BF16_TILE_ROW_BYTES},
+                        {.page_id = stick_page, .offset_bytes = kstart * BF16_TILE_ROW_BYTES},
                         {});
                 }
             } else {
@@ -770,7 +842,8 @@ void kernel_main() {
                                     xbounds.ey,
                                     x_mcast_dests,
                                     /*linked=*/false);
-                                noc.async_writes_flushed();
+                                // the flag cell READ, not just sent (see h_slot_send_posted)
+                                noc.async_writes_flushed<NocOptions::TXN_ID>({.trid = 0});
                                 x_ready.set(INVALID);
                                 x_free.wait(XMCAST_CONSUMERS);
                                 x_free.set(0);
@@ -791,7 +864,8 @@ void kernel_main() {
                             x_ready.set(VALID);
                             x_ready.set_multicast(
                                 noc, xbounds.sx, xbounds.sy, xbounds.ex, xbounds.ey, x_mcast_dests, /*linked=*/false);
-                            noc.async_writes_flushed();
+                            // the flag cell READ, not just sent (see h_slot_send_posted)
+                            noc.async_writes_flushed<NocOptions::TXN_ID>({.trid = 0});
                             // This core becomes a receiver in the next rotating round.
                             x_ready.set(INVALID);
                         } else {
@@ -1285,4 +1359,8 @@ void kernel_main() {
             cb_push_back(cb_h, h_pad);
         }
     }
+    // nothing in flight at return: the next program's kernel snapshots this core's NoC counters as soon as this one
+    // returns, so a late write / atomic ack would wedge ITS next barrier (2026-10-21 hang review)
+    noc.async_write_barrier();
+    noc.async_atomic_barrier();
 }

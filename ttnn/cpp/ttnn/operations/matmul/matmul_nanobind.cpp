@@ -10,16 +10,22 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/tuple.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 
 #include <fmt/format.h>
 #include <fmt/ranges.h>
+#include <enchantum/enchantum.hpp>
 #include <tt-metalium/core_coord.hpp>
+#include <tt-metalium/kernel_types.hpp>
+#include <tt-metalium/mesh_device.hpp>
 #include "ttnn/operations/eltwise/unary/common/unary_op_types.hpp"
 #include "ttnn/operations/matmul/device/config/matmul_program_config.hpp"
 #include "ttnn/operations/matmul/device/matmul_device_operation.hpp"
 #include "ttnn/operations/matmul/device/factory/matmul_multicore_reuse_optimized_program_factory.hpp"
+#include "ttnn/operations/matmul/device/utilities/matmul_utilities.hpp"
 #include "ttnn-nanobind/bind_function.hpp"
 #include "ttnn-nanobind/json_class.hpp"
 #include "ttnn/operations/matmul/matmul.hpp"
@@ -560,15 +566,35 @@ void py_module(nb::module_& mod) {
         This program config is a specialized config for very narrow tensors stored in DRAM.
     )doc");
 
+    nb::enum_<DramReaderPlacement>(mod, "DramReaderPlacement", R"doc(
+        Placement of the DRAM-sharded matmul's bank readers.
+
+        NOC_HOPS (default): each bank's primary reader is the first device's optimal reader; extra readers
+        (num_workers_per_dram_bank > 1) take the free core with the fewest NOC_0 hops to the primary.
+        ROW_PLUS_X: as NOC_HOPS, but an extra reader takes the nearest free core at x+1..x+4 in its primary's row.
+        MESH_ROW_PLUS_X: as ROW_PLUS_X, with each bank's primary chosen among the local devices' optimal readers to
+        minimize the worst NOC_0 hop count from any device's optimal reader (meshes of differently harvested dies).
+    )doc")
+        .value("NOC_HOPS", DramReaderPlacement::NOC_HOPS)
+        .value("ROW_PLUS_X", DramReaderPlacement::ROW_PLUS_X)
+        .value("MESH_ROW_PLUS_X", DramReaderPlacement::MESH_ROW_PLUS_X);
+
     matmul_multi_core_reuse_multicast_dram_sharded_program_config
         .def(
-            nb::init<std::size_t, std::size_t, std::size_t, std::optional<UnaryWithParam>, std::size_t>(),
+            nb::init<
+                std::size_t,
+                std::size_t,
+                std::size_t,
+                std::optional<UnaryWithParam>,
+                std::size_t,
+                DramReaderPlacement>(),
             nb::kw_only(),
             nb::arg("in0_block_w").noconvert(),
             nb::arg("per_core_M").noconvert(),
             nb::arg("per_core_N").noconvert(),
             nb::arg("fused_activation") = nb::none(),
-            nb::arg("num_workers_per_dram_bank") = 1)
+            nb::arg("num_workers_per_dram_bank") = 1,
+            nb::arg("dram_reader_placement") = DramReaderPlacement::NOC_HOPS)
         .def_rw("in0_block_w", &MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig::in0_block_w, R"doc(
             Block width for both input tensors along the K dimension (shared inner dimension).
 
@@ -609,18 +635,28 @@ void py_module(nb::module_& mod) {
             for one bank use NOC0 and the same allocator-selected DRAM endpoint. The per-bank shard
             width in tiles must equal this value times the reader width.
         )doc")
+        .def_rw(
+            "dram_reader_placement",
+            &MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig::dram_reader_placement,
+            R"doc(
+            Placement of the bank readers (DramReaderPlacement). The default NOC_HOPS keeps the established
+            placement; ROW_PLUS_X and MESH_ROW_PLUS_X are opt-in.
+        )doc")
         .def("__repr__", [](const MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig& config) {
             // Include fused_activation in the repr for full visibility during tracing/debugging.
             std::string fused_activation_repr =
                 config.fused_activation.has_value() ? fmt::format("{}", config.fused_activation.value()) : "None";
             return fmt::format(
                 "MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(in0_block_w={}, per_core_M={}, per_core_N={}, "
-                "fused_activation={}, num_workers_per_dram_bank={})",
+                "fused_activation={}, num_workers_per_dram_bank={}{})",
                 config.in0_block_w,
                 config.per_core_M,
                 config.per_core_N,
                 fused_activation_repr,
-                config.num_workers_per_dram_bank);
+                config.num_workers_per_dram_bank,
+                config.dram_reader_placement == DramReaderPlacement::NOC_HOPS
+                    ? std::string{}
+                    : fmt::format(", dram_reader_placement={}", enchantum::to_string(config.dram_reader_placement)));
         });
 
     auto matmul_multi_core_reuse_multicast_batched_dram_sharded_program_config =
@@ -1261,6 +1297,36 @@ void py_module(nb::module_& mod) {
 
         Calls ttnn::prim::matmul directly so tests can exercise fused bias where ttnn.matmul /
         ttnn.linear would not fuse it (they add bias as a separate op when in1 is batched).
+    )doc");
+
+    mod.def(
+        "dram_bank_reader_assignments",
+        [](tt::tt_metal::distributed::MeshDevice& mesh_device,
+           std::size_t num_workers_per_dram_bank,
+           const std::optional<CoreRangeSet>& secondary_reader_excluded_cores,
+           DramReaderPlacement dram_reader_placement) {
+            const auto assignments = ttnn::prim::dram_sharded_helpers::get_dram_bank_reader_assignments(
+                mesh_device,
+                tt::tt_metal::detail::preferred_noc_for_dram_read(mesh_device.arch()),
+                static_cast<uint32_t>(num_workers_per_dram_bank),
+                secondary_reader_excluded_cores.value_or(CoreRangeSet()),
+                dram_reader_placement);
+            std::vector<std::tuple<CoreCoord, uint32_t, uint32_t>> out;
+            out.reserve(assignments.size());
+            for (const auto& assignment : assignments) {
+                out.emplace_back(assignment.worker_core, assignment.bank_id, assignment.worker_index);
+            }
+            return out;
+        },
+        nb::arg("mesh_device"),
+        nb::kw_only(),
+        nb::arg("num_workers_per_dram_bank") = 1,
+        nb::arg("secondary_reader_excluded_cores") = nb::none(),
+        nb::arg("dram_reader_placement") = DramReaderPlacement::NOC_HOPS,
+        R"doc(
+        The bank readers a DRAM-sharded matmul on ``mesh_device`` uses: ``[(worker_core, bank_id, worker_index), ...]``
+        in factory order (bank 0's primary, its extra readers, bank 1, ...). ``secondary_reader_excluded_cores`` are
+        the activation storage cores, which extra readers never use.
     )doc");
 
     // Bind select_program_factory for Python-side factory dispatch

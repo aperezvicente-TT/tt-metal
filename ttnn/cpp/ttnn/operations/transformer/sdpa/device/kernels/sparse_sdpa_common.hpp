@@ -15,7 +15,7 @@ namespace reader_common_arg {
 enum : uint32_t { Q_ADDRESS, KV_ADDRESS, INDICES_ADDRESS, KV_BATCH_PAGE_OFFSET, END };
 }
 namespace writer_common_arg {
-enum : uint32_t { OUTPUT_ADDRESS, KV_ADDRESS, KV_BATCH_PAGE_OFFSET, ATTENTION_SINK_ADDRESS, END };
+enum : uint32_t { OUTPUT_ADDRESS, KV_ADDRESS, KV_BATCH_PAGE_OFFSET, ATTENTION_SINK_ADDRESS, STATS_ADDRESS, END };
 }
 
 constexpr uint32_t SCALE_BLOCK_WIDTH = 128;
@@ -119,6 +119,9 @@ enum : uint32_t {
     USE_ATTENTION_SINK,
     CB_ATTENTION_SINK,
     CB_SINK_SCRATCH,
+    EMIT_STATS,     // 1: drain the per-token (m, l) stats row (split-K attention across devices)
+    CB_STATS,       // compute -> writer: 2 Sqt fp32 tiles per token (m tiles, then l tiles; column 0 = the row's value)
+    CB_STATS_RM,    // writer scratch: one row-major [2 H] fp32 page per token
     END,
 };
 }  // namespace writer_ct_arg
@@ -160,6 +163,8 @@ enum : uint32_t {
     PACKED_ROW_BYTES,
     USE_ATTENTION_SINK,
     CB_ATTENTION_SINK,
+    EMIT_STATS,  // 1: on the last chunk pack the running max and the finalised row-sum as fp32 tiles (CB_STATS)
+    CB_STATS,
     END,
 };
 }  // namespace compute_ct_arg

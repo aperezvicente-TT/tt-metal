@@ -49,12 +49,17 @@ enum SparseCB : uint32_t {
     cb_k_rope_tile,     // scaled FP8 only: one K chunk's BF16 RoPE tiles
     cb_attention_sink,  // persistent first-column vector: one sink scalar per head
     cb_sink_scratch,    // writer scratch for gathering sink scalars
+    cb_stats,           // emit_stats only: compute -> writer, 2 Sqt fp32 tiles per token (m tiles, then l tiles)
+    cb_stats_rm,        // emit_stats only: writer scratch, one row-major [2 H] fp32 page per token
     cb_count
 };
 
 tt::tt_metal::ProgramDescriptor SparseSDPAOperation::SparseSDPAProgramFactory::create_descriptor(
-    const SparseSDPAParams& attrs, const SparseSDPAInputs& t, Tensor& output) {
+    const SparseSDPAParams& attrs, const SparseSDPAInputs& t, std::vector<Tensor>& outputs) {
     tt::tt_metal::ProgramDescriptor desc;
+    Tensor& output = outputs[0];
+    const bool emit_stats = attrs.emit_stats;
+    TT_FATAL(outputs.size() == (emit_stats ? 2u : 1u), "sparse_sdpa: outputs vs emit_stats");
 
     const bool use_attention_sink = t.attention_sink.has_value();
     const uint32_t H = t.q.logical_shape()[1];  // head count, from the tensor (any multiple of TILE_HEIGHT)
@@ -178,6 +183,13 @@ tt::tt_metal::ProgramDescriptor SparseSDPAOperation::SparseSDPAProgramFactory::c
         cb(cb_attention_sink, tile_bytes, Sqt, bf);
         cb(cb_sink_scratch, H * sizeof(uint16_t), 1, bf);
     }
+    if (emit_stats) {
+        // the compute packs the Sqt running-max tiles and the Sqt finalised row-sum tiles (fp32 tiles) once per token
+        // (double-buffered: the writer drains token k while the compute runs token k + 1); the writer gathers column
+        // 0 of every row into one [2 H] fp32 page
+        cb(cb_stats, fp32_tile_bytes, 2 * Sqt * ::sparse_sdpa::CB_DOUBLE_BUFFER_DEPTH, fp32);
+        cb(cb_stats_rm, 2 * H * sizeof(float), 1, fp32);
+    }
 
     // ---- compile-time args ----
     // CB ids are passed to each kernel as compile-time args (the SparseCB enum is the single source).
@@ -231,6 +243,7 @@ tt::tt_metal::ProgramDescriptor SparseSDPAOperation::SparseSDPAProgramFactory::c
         writer_ct.end(),
         {static_cast<uint32_t>(scaled_kv), k_dim, kv_elem_bytes, cb_idx, cb_kreq, cb_kack, packed_page_bytes});
     writer_ct.insert(writer_ct.end(), {static_cast<uint32_t>(use_attention_sink), cb_attention_sink, cb_sink_scratch});
+    writer_ct.insert(writer_ct.end(), {static_cast<uint32_t>(emit_stats), cb_stats, cb_stats_rm});
     TT_FATAL(
         writer_ct.size() == ::sparse_sdpa::writer_ct_arg::END,
         "sparse_sdpa writer compile-time argument layout is out of sync");
@@ -240,6 +253,8 @@ tt::tt_metal::ProgramDescriptor SparseSDPAOperation::SparseSDPAProgramFactory::c
         .append_to(writer_ct, writer_crt);
     tt::tt_metal::TensorAccessorArgs(use_attention_sink ? t.attention_sink->buffer() : nullptr)
         .append_to(writer_ct, writer_crt);
+    // the stats output's accessor chains after the sink's (a null accessor when emit_stats is off)
+    tt::tt_metal::TensorAccessorArgs(emit_stats ? outputs[1].buffer() : nullptr).append_to(writer_ct, writer_crt);
 
     std::vector<uint32_t> compute_ct = {H,
                                         DHt,
@@ -309,6 +324,7 @@ tt::tt_metal::ProgramDescriptor SparseSDPAOperation::SparseSDPAProgramFactory::c
     compute_ct.push_back(qsb);
     compute_ct.push_back(packed_page_bytes);
     compute_ct.insert(compute_ct.end(), {static_cast<uint32_t>(use_attention_sink), cb_attention_sink});
+    compute_ct.insert(compute_ct.end(), {static_cast<uint32_t>(emit_stats), cb_stats});
     TT_FATAL(
         compute_ct.size() == ::sparse_sdpa::compute_ct_arg::END,
         "sparse_sdpa compute compile-time argument layout is out of sync");
@@ -344,7 +360,11 @@ tt::tt_metal::ProgramDescriptor SparseSDPAOperation::SparseSDPAProgramFactory::c
     const uint32_t kv_batch_page_offset = attrs.cache_batch_idx.value_or(0) * kv_T;
     reader_desc.emplace_common_runtime_args({q_buf, kv_buf, idx_buf, kv_batch_page_offset});
     writer_desc.emplace_common_runtime_args(
-        {out_buf, kv_buf, kv_batch_page_offset, use_attention_sink ? t.attention_sink->buffer() : nullptr});
+        {out_buf,
+         kv_buf,
+         kv_batch_page_offset,
+         use_attention_sink ? t.attention_sink->buffer() : nullptr,
+         emit_stats ? outputs[1].buffer() : nullptr});
     TT_FATAL(
         reader_desc.common_runtime_args.size() == ::sparse_sdpa::reader_common_arg::END &&
             writer_desc.common_runtime_args.size() == ::sparse_sdpa::writer_common_arg::END,
@@ -371,7 +391,7 @@ void SparseSDPAOperation::SparseSDPAProgramFactory::override_runtime_arguments(
     tt::tt_metal::Program& program,
     const SparseSDPAParams& operation_attributes,
     const SparseSDPAInputs& tensor_args,
-    Tensor& tensor_return_value,
+    std::vector<Tensor>& tensor_return_value,
     const std::optional<ttnn::MeshCoordinate>& /*mesh_dispatch_coordinate*/) {
     // Token assignments are fixed by the hashed q shape. Refresh only the uniform dispatch values;
     // tensor-accessor metadata follows these slots and remains unchanged under the cache key.
@@ -384,7 +404,10 @@ void SparseSDPAOperation::SparseSDPAProgramFactory::override_runtime_arguments(
     reader_args[::sparse_sdpa::reader_common_arg::KV_ADDRESS] = kv;
     reader_args[::sparse_sdpa::reader_common_arg::INDICES_ADDRESS] = t.indices.buffer()->address();
     reader_args[::sparse_sdpa::reader_common_arg::KV_BATCH_PAGE_OFFSET] = offset;
-    writer_args[::sparse_sdpa::writer_common_arg::OUTPUT_ADDRESS] = tensor_return_value.buffer()->address();
+    writer_args[::sparse_sdpa::writer_common_arg::OUTPUT_ADDRESS] = tensor_return_value[0].buffer()->address();
+    // the stats output (emit_stats is in the hash: a hit has the same output count as its miss)
+    writer_args[::sparse_sdpa::writer_common_arg::STATS_ADDRESS] =
+        tensor_return_value.size() > 1 ? tensor_return_value[1].buffer()->address() : 0u;
     writer_args[::sparse_sdpa::writer_common_arg::KV_ADDRESS] = kv;
     writer_args[::sparse_sdpa::writer_common_arg::KV_BATCH_PAGE_OFFSET] = offset;
     writer_args[::sparse_sdpa::writer_common_arg::ATTENTION_SINK_ADDRESS] =

@@ -5,6 +5,7 @@
 #include "kernels/chronology.hpp"
 #include "ttnn/types.hpp"
 #include "ttnn/operations/experimental/kda/factory/kda_factory_utils.hpp"
+#include "ttnn/operations/experimental/kda/factory/chronology_binding.hpp"
 namespace ttnn::experimental::prim {
 ChronologicalSelectionsOperation::program_factory_t ChronologicalSelectionsOperation::select_program_factory(
     const operation_attributes_t&, const tensor_args_t&) {
@@ -17,8 +18,8 @@ void ChronologicalSelectionsOperation::validate_on_program_cache_miss(
         kda_factory_detail::check_actual_start(in.actual_start, *in.actual_end, "chronological_selections");
     }
     TT_FATAL(
-        a.sequence_parallel_axis < in.actual_start.device()->shape().dims() && a.local_rows > 0 &&
-            a.local_rows % tt::constants::TILE_HEIGHT == 0,
+        kda_factory_detail::kda_sequence_axis_ok(a.sequence_parallel_axis, in.actual_start.device()->shape().dims()) &&
+            a.local_rows > 0 && a.local_rows % tt::constants::TILE_HEIGHT == 0,
         "chronological_selections: invalid partition geometry");
     TT_FATAL(a.batch_heads > 0 && a.key_dim > 0 && a.value_dim > 0, "chronological_selections: invalid state geometry");
 }

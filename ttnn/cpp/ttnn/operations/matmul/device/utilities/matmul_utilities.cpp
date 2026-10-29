@@ -398,14 +398,94 @@ void get_optimal_dram_bank_to_reader_assignment(
     all_worker_cores = tt::tt_metal::CoreRangeSet(all_cores_set);
 }
 
+namespace {
+
+constexpr uint32_t kRowPlusXMaxOffset = 4;
+
+std::vector<tt::tt_metal::IDevice*> mesh_placement_devices(const tt::tt_metal::distributed::MeshDevice& device) {
+    auto devices = device.get_devices();
+    TT_FATAL(!devices.empty(), "Mesh-aware DRAM reader placement requires a local device");
+    const auto worker_grid = device.compute_with_storage_grid_size();
+    for (const auto* local_device : devices) {
+        TT_FATAL(
+            local_device->compute_with_storage_grid_size() == worker_grid &&
+                local_device->num_dram_channels() == devices.front()->num_dram_channels(),
+            "Mesh-aware DRAM reader placement requires the same worker grid and DRAM bank count on every device");
+    }
+    return devices;
+}
+
+std::vector<tt::tt_metal::CoreCoord> mesh_primary_workers(
+    const std::vector<tt::tt_metal::IDevice*>& devices, tt::tt_metal::NOC noc) {
+    std::vector<std::vector<tt::tt_metal::CoreCoord>> optimal;
+    optimal.reserve(devices.size());
+    for (auto* local_device : devices) {
+        optimal.push_back(local_device->get_optimal_dram_bank_to_logical_worker_assignment(noc));
+        TT_FATAL(
+            optimal.back().size() == optimal.front().size(),
+            "Mesh-aware DRAM reader placement requires the same DRAM bank count on every device");
+    }
+    std::vector<tt::tt_metal::CoreCoord> primaries;
+    primaries.reserve(optimal.front().size());
+    std::set<tt::tt_metal::CoreCoord> used;
+    for (uint32_t bank = 0; bank < optimal.front().size(); ++bank) {
+        bool found = false;
+        tt::tt_metal::CoreCoord best_worker{};
+        uint32_t best_worst = std::numeric_limits<uint32_t>::max();
+        uint32_t best_total = std::numeric_limits<uint32_t>::max();
+        for (const auto& device_optimal : optimal) {
+            const auto candidate = device_optimal[bank];
+            if (used.contains(candidate)) {
+                continue;
+            }
+            uint32_t worst = 0;
+            uint32_t total = 0;
+            for (size_t device_index = 0; device_index < devices.size(); ++device_index) {
+                const uint32_t hops = tt::tt_metal::experimental::Device::get_worker_noc_hop_distance(
+                    devices[device_index], optimal[device_index][bank], candidate, noc);
+                worst = std::max(worst, hops);
+                total += hops;
+            }
+            if (worst < best_worst || (worst == best_worst && total < best_total)) {
+                found = true;
+                best_worker = candidate;
+                best_worst = worst;
+                best_total = total;
+            }
+        }
+        TT_FATAL(found, "No free mesh-aware DRAM reader core for bank {}", bank);
+        used.insert(best_worker);
+        primaries.push_back(best_worker);
+    }
+    return primaries;
+}
+
+}  // namespace
+
 std::vector<DramBankReaderAssignment> get_dram_bank_reader_assignments(
     tt::tt_metal::distributed::MeshDevice& device,
     tt::tt_metal::NOC noc,
     uint32_t workers_per_bank,
-    const tt::tt_metal::CoreRangeSet& secondary_reader_excluded_cores) {
+    const tt::tt_metal::CoreRangeSet& secondary_reader_excluded_cores,
+    ttnn::operations::matmul::DramReaderPlacement placement) {
+    using ttnn::operations::matmul::DramReaderPlacement;
     validate_num_workers_per_dram_bank(workers_per_bank);
 
-    const auto primary_workers = device.get_optimal_dram_bank_to_logical_worker_assignment(noc);
+    std::vector<tt::tt_metal::IDevice*> mesh_devices;
+    std::vector<tt::tt_metal::CoreCoord> primary_workers;
+    // Per mesh device, the bank's own optimal (firmware-approved endpoint) reader: the data of a bank flows from that
+    // endpoint to every reader of the bank, so the opt-in placements measure secondary-reader candidates in that
+    // direction (MESH_ROW_PLUS_X: worst case over the mesh devices).
+    std::vector<std::vector<tt::tt_metal::CoreCoord>> mesh_optimal;
+    if (placement == DramReaderPlacement::MESH_ROW_PLUS_X) {
+        mesh_devices = mesh_placement_devices(device);
+        primary_workers = mesh_primary_workers(mesh_devices, noc);
+        for (auto* local_device : mesh_devices) {
+            mesh_optimal.push_back(local_device->get_optimal_dram_bank_to_logical_worker_assignment(noc));
+        }
+    } else {
+        primary_workers = device.get_optimal_dram_bank_to_logical_worker_assignment(noc);
+    }
     std::vector<DramBankReaderAssignment> assignments;
     assignments.reserve(primary_workers.size() * workers_per_bank);
 
@@ -431,7 +511,18 @@ std::vector<DramBankReaderAssignment> get_dram_bank_reader_assignments(
             bool found = false;
             uint32_t best_cost = std::numeric_limits<uint32_t>::max();
             tt::tt_metal::CoreCoord best_worker{};
-            for (uint32_t x = 0; x < worker_grid.x; ++x) {
+            if (placement != DramReaderPlacement::NOC_HOPS) {
+                for (uint32_t dx = 1; dx <= kRowPlusXMaxOffset && !found; ++dx) {
+                    const tt::tt_metal::CoreCoord candidate{primary.x + dx, primary.y};
+                    if (candidate.x >= worker_grid.x || used.contains(candidate) ||
+                        secondary_reader_excluded_cores.contains(candidate)) {
+                        continue;
+                    }
+                    found = true;
+                    best_worker = candidate;
+                }
+            }
+            for (uint32_t x = 0; x < worker_grid.x && !found; ++x) {
                 for (uint32_t y = 0; y < worker_grid.y; ++y) {
                     const tt::tt_metal::CoreCoord candidate{x, y};
                     if (used.contains(candidate) || secondary_reader_excluded_cores.contains(candidate)) {
@@ -443,21 +534,36 @@ std::vector<DramBankReaderAssignment> get_dram_bank_reader_assignments(
                     // This factory shares one logical reader placement across the mesh, as it
                     // already does for primary readers. Use a representative chip for the hop
                     // heuristic; bank addressing still uses each executing chip's allocator table.
-                    const uint32_t cost = tt::tt_metal::experimental::Device::get_worker_noc_hop_distance(
-                        &device,
-                        tt::tt_metal::distributed::MeshCoordinate::zero_coordinate(device.shape().dims()),
-                        candidate,
-                        primary_workers[bank],
-                        noc);
+                    // NOC_HOPS keeps the #54242 metric (candidate -> primary) so the default placement is unchanged.
+                    // The opt-in placements measure in the data direction (bank endpoint reader -> candidate): the
+                    // NoC hop distance is directional (NOC0 = +x then +y with wrap), and the reversed metric put the
+                    // fallback secondaries 11-14 hops downstream of the bank (P4 review F1).
+                    uint32_t cost = 0;
+                    if (mesh_devices.empty()) {
+                        const auto mesh_zero =
+                            tt::tt_metal::distributed::MeshCoordinate::zero_coordinate(device.shape().dims());
+                        cost = placement == DramReaderPlacement::NOC_HOPS
+                                   ? tt::tt_metal::experimental::Device::get_worker_noc_hop_distance(
+                                         &device, mesh_zero, candidate, primary, noc)
+                                   : tt::tt_metal::experimental::Device::get_worker_noc_hop_distance(
+                                         &device, mesh_zero, primary, candidate, noc);
+                    } else {
+                        for (size_t device_index = 0; device_index < mesh_devices.size(); ++device_index) {
+                            cost = std::max(
+                                cost,
+                                tt::tt_metal::experimental::Device::get_worker_noc_hop_distance(
+                                    mesh_devices[device_index], mesh_optimal[device_index][bank], candidate, noc));
+                        }
+                    }
                     // Equal-cost candidates use the same endpoint and hop count. Keep the first candidate in ascending
                     // x/y scan order so that the assignment is deterministic without adding a second routing objective.
                     if (cost < best_cost) {
-                        found = true;
                         best_cost = cost;
                         best_worker = candidate;
                     }
                 }
             }
+            found = found || best_cost != std::numeric_limits<uint32_t>::max();
             TT_FATAL(found, "No free DRAM reader {} core for bank {}", worker_index, bank);
             used.insert(best_worker);
             assignments.push_back({best_worker, bank, worker_index});

@@ -381,7 +381,8 @@ tt::tt_metal::ProgramDescriptor create_moe_fused_swiglu_program_descriptor(
     const CoreRangeSet all_cores{CoreRange({0, 0}, {hgroups - 1, kgroups - 1})};
 
     const uint32_t emb = tensor_arguments.activations.logical_shape()[-1];
-    const uint32_t hidden = tensor_arguments.w_gates[0].logical_shape()[-1];
+    // gate_up_interleaved: w_gates[0] is the [emb, 2 * hidden] gate|up tensor; hidden = the down K
+    const uint32_t hidden = tensor_arguments.w_downs[0].logical_shape()[-2];
     const bool activations_are_row_major = tensor_arguments.activations.layout() == Layout::ROW_MAJOR;
     const DataFormat weight_format = datatype_to_dataformat_converter(tensor_arguments.w_gates[0].dtype());
     const DataFormat output_format = datatype_to_dataformat_converter(tensor_return_value.dtype());
@@ -406,11 +407,36 @@ tt::tt_metal::ProgramDescriptor create_moe_fused_swiglu_program_descriptor(
         bfp8_tile,
         bf16_tile,
         activation_slice,
-        l1_max - geo::L1_CB_RESERVE,
+        operation_arguments.l1_budget_bytes != 0
+            ? std::min<uint32_t>(operation_arguments.l1_budget_bytes, l1_max - geo::L1_CB_RESERVE)
+            : l1_max - geo::L1_CB_RESERVE,
         output_tile,
         /*enable_phase_alias_=*/true,
         activations_are_row_major,
-        operation_arguments.fuse_bias);
+        operation_arguments.fuse_bias,
+        operation_arguments.gather_x);
+
+    // The writer / compute step cb_h_slice by SLICE_FULL = M_BLOCK * hn_pad / kgroups while the host sizes it from the
+    // scatter plan (the largest divisor of M_BLOCK * hn_pad that is <= kgroups): the two agree only when kgroups
+    // divides M_BLOCK * hn_pad. Elsewhere (e.g. a 12x10 grid at hidden 2048: 48 / 10) the pops cannot close the ring --
+    // a watcher fifo_limit assert, or a hang / silent corruption without the watcher (Stage 16, 2026-10-20 17:52Z).
+    TT_FATAL(
+        (geo::M_BLOCK * blocking.hn_pad) % kgroups == 0,
+        "moe_fused_swiglu: grid {}x{} needs kgroups ({}) dividing M_BLOCK * hn_pad ({} * {}); pass core_grid "
+        "(e.g. 11x8)",
+        hgroups,
+        kgroups,
+        kgroups,
+        geo::M_BLOCK,
+        blocking.hn_pad);
+    if (std::getenv("MOE_FUSED_SWIGLU_DESCRIBE") != nullptr) {
+        log_info(
+            tt::LogOp,
+            "moe_fused_swiglu geometry: {}; CB bytes {} of budget {}",
+            blocking.describe(),
+            blocking.l1_bytes(activations_are_row_major, output_tile, true),
+            blocking.l1_budget);
+    }
 
     const bool direct_write = tensor_arguments.expert_region_offsets.has_value();
     const Tensor& start_tensor = direct_write ? *tensor_arguments.expert_region_offsets : tensor_arguments.counts;
@@ -495,8 +521,15 @@ tt::tt_metal::ProgramDescriptor create_moe_fused_swiglu_program_descriptor(
     // shards-per-row count coprime with the bank count, which is what rotates a core's K-rows
     // across all DRAM banks.
     const uint32_t wd = geo::nd_shard_n_tiles(tensor_arguments.w_downs[0]);
-    warn_if_gate_up_shard_splits_runs(blocking, wg);
+    if (!operation_arguments.gate_up_interleaved) {  // interleaved columns are read one tile per transaction
+        warn_if_gate_up_shard_splits_runs(blocking, wg);
+    }
     const uint32_t experts_per_chip = operation_arguments.experts_per_chip;
+    // ROW_CAPACITY bounds every region base the reader accepts. Gathering, the regions live in x_row_index's row
+    // space (validated tile-aligned), not in the undispatched activation rows.
+    const uint32_t row_capacity = operation_arguments.gather_x
+                                      ? static_cast<uint32_t>(tensor_arguments.x_row_index->logical_shape()[-1])
+                                      : static_cast<uint32_t>(tensor_arguments.activations.padded_shape()[-2]);
 
     auto reader_ct = make_reader_ct(
         blocking,
@@ -510,7 +543,7 @@ tt::tt_metal::ProgramDescriptor create_moe_fused_swiglu_program_descriptor(
         idx_page,
         static_cast<uint32_t>(tensor_arguments.counts.logical_shape()[-1]),
         start_page,
-        static_cast<uint32_t>(tensor_arguments.activations.padded_shape()[-2]),
+        row_capacity,
         weight_tile,
         bfp8_tile,
         wg,
@@ -539,6 +572,16 @@ tt::tt_metal::ProgramDescriptor create_moe_fused_swiglu_program_descriptor(
             TensorAccessorArgs(buffer).append_to(reader_ct);
         }
     }
+    // Gathered x read: the index-scratch CB id, the activation row count every gathered index is clamped to, the
+    // index tensor's page size, then its accessor. Appended after the (optional) bias block so no offset the
+    // reader already derives moved; only present when gather_x, which is in the program cache key.
+    if (operation_arguments.gather_x) {
+        auto* index_buffer = tensor_arguments.x_row_index->buffer();
+        reader_ct.push_back(geo::CB_X_ROW_INDEX);
+        reader_ct.push_back(static_cast<uint32_t>(tensor_arguments.activations.padded_shape()[-2]));
+        reader_ct.push_back(std::max<uint32_t>(index_buffer->aligned_page_size(), dram_alignment));
+        TensorAccessorArgs(index_buffer).append_to(reader_ct);
+    }
 
     auto writer_ct = make_writer_ct(
         blocking,
@@ -561,6 +604,9 @@ tt::tt_metal::ProgramDescriptor create_moe_fused_swiglu_program_descriptor(
     if (operation_arguments.fuse_bias) {
         dataflow_defines.emplace_back("FUSE_BIAS", "1");
     }
+    if (operation_arguments.gate_up_interleaved) {
+        dataflow_defines.emplace_back("MOE_GU_INTERLEAVED", "1");
+    }
     KernelDescriptor::Defines compute_defines;
     if (stage_profile_enabled()) {
         dataflow_defines.emplace_back("MOE_FUSED_SWIGLU_STAGE_PROFILE", "1");
@@ -575,6 +621,10 @@ tt::tt_metal::ProgramDescriptor create_moe_fused_swiglu_program_descriptor(
         .defines = dataflow_defines,
         .config = ReaderConfigDescriptor{},
     };
+    // Reader-only: the writer never reads x, so its binary stays the non-gather one.
+    if (operation_arguments.gather_x) {
+        reader_descriptor.defines.emplace_back("MOE_GATHER_X", "1");
+    }
     KernelDescriptor writer_descriptor{
         .kernel_source = std::string(KERNEL_ROOT) + "/moe_fused_swiglu_writer.cpp",
         .source_type = KernelDescriptor::SourceType::FILE_PATH,
@@ -610,6 +660,8 @@ tt::tt_metal::ProgramDescriptor create_moe_fused_swiglu_program_descriptor(
     }
     if (operation_arguments.activation == RoutedExpertActivation::SituGlu) {
         compute_descriptor.defines.emplace_back("SITU_GLU", "1");
+    } else if (operation_arguments.activation == RoutedExpertActivation::ClampedSiluGlu) {
+        compute_descriptor.defines.emplace_back("CLAMPED_SILU_GLU", "1");
     } else if (operation_arguments.activation == RoutedExpertActivation::SwiGluOai) {
         compute_descriptor.defines.emplace_back("SWIGLU_OAI", "1");
     }
@@ -639,6 +691,13 @@ tt::tt_metal::ProgramDescriptor create_moe_fused_swiglu_program_descriptor(
                 reader_bindings.push_back(bias.buffer());
             }
         }
+    }
+    // The gathered-x index table's base, after the biases so every existing common offset is unmoved. Pushed
+    // as a Buffer*, so it registers as a common buffer binding: x_row_index is a tensor argument, and the
+    // cache-hit fast path (resolve_bindings / apply_resolved_bindings) re-patches this slot with the current
+    // dispatch's address exactly like the activation / counts / start slots above.
+    if (operation_arguments.gather_x) {
+        reader_bindings.push_back(tensor_arguments.x_row_index->buffer());
     }
     for (const auto* weights : {&tensor_arguments.w_ups, &tensor_arguments.w_downs}) {
         for (const auto& weight : *weights) {

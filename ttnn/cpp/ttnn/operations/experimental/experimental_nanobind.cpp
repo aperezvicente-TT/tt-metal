@@ -77,6 +77,9 @@
 #include "ttnn/operations/experimental/deepseek/mla/matmul_wo/matmul_wo_nanobind.hpp"
 #include "ttnn/operations/experimental/deepseek/moe/deepseek_moe_gate/deepseek_moe_gate_nanobind.hpp"
 #include "ttnn/operations/experimental/deepseek/moe/generalized_moe_gate/generalized_moe_gate_nanobind.hpp"
+#include "ttnn/operations/experimental/deepseek/moe/fused_experts/fused_experts_nanobind.hpp"
+#include "ttnn/operations/experimental/deepseek/hyperconnection/fused_hyperconnection_nanobind.hpp"
+#include "ttnn/operations/experimental/deepseek/mix_streams/mix_streams_nanobind.hpp"
 #include "ttnn/operations/experimental/indexer_score/indexer_score_nanobind.hpp"
 #include "ttnn/operations/experimental/kda/kda_nanobind.hpp"
 #include "ttnn/operations/experimental/ccl/moe_gpt/moe_gpt_nanobind.hpp"
@@ -94,6 +97,7 @@
 #include "ttnn/operations/experimental/deepseek_prefill/post_combine_reduce/post_combine_reduce_nanobind.hpp"
 #include "ttnn/operations/experimental/deepseek_prefill/masked_bincount/masked_bincount_nanobind.hpp"
 #include "ttnn/operations/experimental/high_bw_all_gather/high_bw_all_gather_nanobind.hpp"
+#include "ttnn/operations/experimental/pcie_exchange/pcie_exchange_nanobind.hpp"
 #include "ttnn/operations/experimental/deepseek_prefill/offset_cumsum/offset_cumsum_nanobind.hpp"
 #include "ttnn/operations/experimental/deepseek_prefill/moe_padding_config/moe_padding_config_nanobind.hpp"
 #include "ttnn/operations/experimental/deepseek_prefill/outbound_socket_service_sync/outbound_socket_service_sync_nanobind.hpp"
@@ -174,6 +178,7 @@ void py_module(nb::module_& mod) {
     matmul_decode::detail::bind_matmul_decode_operation(mod);
     deepseek_prefill::masked_bincount::detail::bind_experimental_masked_bincount_operation(mod);
     high_bw_all_gather::detail::bind_experimental_high_bw_all_gather_operation(mod);
+    pcie_exchange::detail::bind_experimental_pcie_exchange_operation(mod);
     deepseek_prefill::combine_fabric2d::detail::bind_experimental_combine_fabric2d_operation(mod);
     deepseek_prefill::dispatch_fabric2d::detail::bind_experimental_dispatch_fabric2d_operation(mod);
     deepseek_prefill::offset_cumsum::detail::bind_experimental_offset_cumsum_operation(mod);
@@ -222,6 +227,9 @@ void py_module(nb::module_& mod) {
     deepseek::moe::detail::bind_moe_gate_mm(mod);
     deepseek::moe::detail::bind_deepseek_moe_gate(mod);
     deepseek::moe::detail::bind_generalized_moe_gate(mod);
+    deepseek::moe::detail::bind_fused_experts(mod);
+    deepseek::detail::bind_fused_hyperconnection(mod);
+    deepseek::detail::bind_mix_streams(mod);
     topk_large_indices::detail::bind_topk_large_indices(mod);
     topk_router_gpt::detail::bind_topk_router_gpt(mod);
     deepseek::mla::detail::bind_matmul_wo(mod);

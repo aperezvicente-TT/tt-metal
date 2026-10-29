@@ -645,8 +645,8 @@ void kernel_main() {
         group_stride,
         {schedule_ring_size, schedule_units, 0, 0, schedule_blocks, schedule_cols, schedule_rotate});
     const uint32_t row_group0 = schedule.row_group;
-    const uint32_t band0 = schedule.band_start;
-    const uint32_t num_bands = schedule.band_count;
+    uint32_t band0 = schedule.band_start;
+    uint32_t num_bands = schedule.band_count;
     constexpr uint32_t max_bands = schedule_max_bands;
     constexpr uint32_t fused_common_base = indexer_common::reader::Count + fused_physical_sp;
     constexpr uint32_t x_base =
@@ -820,7 +820,7 @@ void kernel_main() {
         }
     };
 
-    if constexpr (fused_ring_enabled && metadata_mode) {
+    if constexpr (metadata_mode) {
         // Derive causal values before the blocking ring receiver so compute can consume them independently.
         // The factory supplies meta_rt_base to keep this layout coupled to the runtime-argument builder.
         CircularBuffer cb_derived(cb_meta_derived);
@@ -859,8 +859,21 @@ void kernel_main() {
             meta_Sq);
         // Derive kv_len from the same position used for causal geometry. Round compressed history up to a
         // whole K tile; any padded rows in that boundary tile remain future-masked by the exact causal mask.
-        uint32_t derived_kv_len_tiles =
-            (chunk_start_idx + 32 * key_compression_ratio - 1) / (32 * key_compression_ratio) + chunk_global_tiles;
+        uint32_t derived_kv_len_tiles;
+        if constexpr (block_cyclic) {
+            derived_kv_len_tiles =
+                (chunk_start_idx + 32 * key_compression_ratio - 1) / (32 * key_compression_ratio) + chunk_global_tiles;
+        } else {
+            // Classic contiguous K (the per-chunk causal bound of a traced chunked prefill): rank r = device_index +
+            // tp_index owns query rows [chunk_start + r Sq, +Sq); its last row sees the compressed keys
+            // < (chunk_start + (r + 1) Sq) / ratio, rounded up to a whole K tile. Keys past that are never visible
+            // to this device's rows (the causal stamp masks the boundary tile), so the selection is exact; the
+            // writer leaves the columns past the bound unwritten.
+            const uint32_t rank =
+                get_common_arg_val<uint32_t>(meta_rt_base + 1) + get_common_arg_val<uint32_t>(meta_rt_base + 2);
+            derived_kv_len_tiles = (chunk_start_idx + (rank + 1) * meta_Sq + 32 * key_compression_ratio - 1) /
+                                   (32 * key_compression_ratio);
+        }
         // Cap at the REAL token end when the host supplied it. Uncapped, this is the padded-window end, so
         // on a partial chunk the score covers columns this request never wrote: harmless for real query
         // rows (those keys sit at s > t and the causal edge masks them) but NOT for pad rows, whose top-k
@@ -907,6 +920,16 @@ void kernel_main() {
         wmailbox->straddle_jump_tiles = bounds.straddle_jump_tiles;
         clobber_all_memory();
         cb_wmeta.push_back(1);
+        if constexpr (!fused_ring_enabled) {  // the kv-balanced split (indexer_schedule::for_core_kv)
+            const auto kvs = indexer_schedule::for_core_kv(
+                core_id,
+                group_stride,
+                {schedule_ring_size, schedule_units, 0, 0, schedule_blocks, schedule_cols, schedule_rotate},
+                kv_len_tiles,
+                k_tiles_per_unit);
+            band0 = kvs.band_start;
+            num_bands = kvs.band_count;
+        }
     }
 
     if constexpr (fused_ring_enabled) {

@@ -679,6 +679,7 @@ void tensor_mem_config_module(nb::module_& m_tensor) {
             nb::arg("filename"),
             nb::arg("tensor"),
             nb::arg("mode") = DumpTensorMode::DISTRIBUTED_GATHER,
+            nb::call_guard<nb::gil_scoped_release>(),  // pure C++ file I/O: lets cache writes overlap Python work
             R"doc(
                 Dump tensor to file using FlatBuffer format with inline file storage.
             )doc")
@@ -687,6 +688,9 @@ void tensor_mem_config_module(nb::module_& m_tensor) {
             nb::overload_cast<const std::string&, MeshDevice*>(&load_tensor_flatbuffer),
             nb::arg("file_name"),
             nb::arg("device") = nullptr,
+            // pure C++ file read (+ host->device copy when `device` is given): releasing the GIL lets loads of
+            // different devices proceed from different host threads (per-chip parallel weight loading)
+            nb::call_guard<nb::gil_scoped_release>(),
             R"doc(
                 Load tensor to file using FlatBuffer format with inline file storage.
             )doc");

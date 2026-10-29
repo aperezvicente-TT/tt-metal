@@ -1616,6 +1616,107 @@ def recurrent_gated_delta_rule(
     return o, state
 
 
+def kda_l2norm(x, dim: int = -1, eps: float = 1e-6):
+    """KDA L2 normalisation of GLM-5.3-Flash (modeling:451-459): x / sqrt(sum x^2 + eps)."""
+    import torch
+
+    return x / torch.sqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+
+
+def recurrent_kda(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    initial_state=None,
+    use_qk_l2norm: bool = True,
+    scale: float | None = None,
+    *,
+    output_per_token_state: bool = False,
+):
+    """
+    Token-by-token Kimi Delta Attention recurrence, statement for statement the GLM-5.3-Flash reference
+    `recurrent_kda` (glm53-flash-bringup reference/glm5_next_text/modules.py, modeling:462-513), plus the per-token
+    states of the speculative-verify form.
+
+    Args:
+        q, k: [B, T, H, K]; v: [B, T, H, V]
+        g: [B, T, H, K] per-key-channel log decay (<= 0)
+        beta: [B, T, H]
+        initial_state: [B, H, K, V] (zeros when None)
+        use_qk_l2norm: normalise q and k with `kda_l2norm` (fp32)
+        scale: query scale, 1 / sqrt(K) by default (applied after the L2 norm)
+        output_per_token_state: also return the state after every token, [B, T, H, K, V]
+
+    Returns:
+        o [B, T, H, V] in q's dtype, the final state [B, H, K, V] fp32, and the per-token states (or None).
+    """
+    import torch
+
+    initial_dtype = q.dtype
+    q, k, v, g, beta = [x.to(torch.float32) for x in (q, k, v, g, beta)]
+    if use_qk_l2norm:
+        q = kda_l2norm(q, dim=-1, eps=1e-6)
+        k = kda_l2norm(k, dim=-1, eps=1e-6)
+    b, t, h, dk = k.shape
+    dv = v.shape[-1]
+    q = q * ((1 / (q.shape[-1] ** 0.5)) if scale is None else scale)
+    out = torch.zeros(b, t, h, dv, dtype=v.dtype, device=v.device)
+    state = torch.zeros(b, h, dk, dv, dtype=v.dtype, device=v.device) if initial_state is None else initial_state.to(v)
+    states = torch.zeros(b, t, h, dk, dv, dtype=v.dtype, device=v.device) if output_per_token_state else None
+    for i in range(t):
+        q_i, k_i, v_i = q[:, i], k[:, i], v[:, i]
+        g_i = g[:, i][..., None].exp()
+        b_i = beta[:, i][..., None]
+        state = state * g_i
+        kv_mem = (state * k_i[..., None]).sum(dim=-2)
+        delta = (v_i - kv_mem) * b_i
+        state = state + k_i.unsqueeze(-1) * delta.unsqueeze(-2)
+        out[:, i] = (state * q_i.unsqueeze(-1)).sum(dim=-2)
+        if states is not None:
+            states[:, i] = state
+    return out.to(initial_dtype), state, states
+
+
+def fused_recurrent_kda_golden(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    *,
+    scale=None,
+    initial_state=None,
+    output_final_state=False,
+    output_per_token_state=False,
+    use_qk_l2norm=True,
+    **_,
+):
+    """Golden of ttnn.experimental.kda.fused_recurrent_kda. q/k/g/v may be [B, T, H, D] or [B, T, H*D] (H from
+    beta [B, T, H]). Returns (o [B, T, H, V] fp32, state): the state is [B, T, H, K, V] with output_per_token_state,
+    [B, H, K, V] with output_final_state, else None."""
+    import torch
+
+    bsz, t, h = beta.shape
+    q, k, g, v = [x.reshape(bsz, t, h, -1) for x in (q, k, g, v)]
+    o, final, states = recurrent_kda(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=initial_state,
+        use_qk_l2norm=use_qk_l2norm,
+        scale=scale,
+        output_per_token_state=output_per_token_state,
+    )
+    o = o.to(torch.float32)
+    if output_per_token_state:
+        return o, states
+    return o, final if output_final_state else None
+
+
 def chunk_gated_delta_rule(
     q,
     k,
@@ -1871,10 +1972,13 @@ __all__ = [
     "flash_multi_latent_attention_decode_golden",
     "gated_delta_attn_seq_golden",
     "joint_scaled_dot_product_attention_golden",
+    "fused_recurrent_kda_golden",
+    "kda_l2norm",
     "l2_norm",
     "paged_flash_multi_latent_attention_decode_golden",
     "paged_scaled_dot_product_attention_decode_golden",
     "recurrent_gated_delta_rule",
+    "recurrent_kda",
     "ring_distributed_scaled_dot_product_attention_golden",
     "ring_joint_scaled_dot_product_attention_golden",
     "ring_mla_golden",

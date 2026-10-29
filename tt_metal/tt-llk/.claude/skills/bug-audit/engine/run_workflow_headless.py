@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run ONE workflow script to completion in headless Claude sessions that cannot lose finished work (use in tmux).
+"""Run ONE workflow script to completion in headless the program sessions that cannot lose finished work (use in tmux).
 
   run_workflow_headless.py --script SCRIPT.js --args ARGS.json --out OUTPUT.json --workdir DIR
                            [--add-dir PATH ...] [--max-attempts 12] [--then 'shell command']

@@ -21,7 +21,7 @@ import ttnn
 
 
 # ============================================================================
-# Model Implementation by Claude and Codex with manually edits
+# Model Implementation by the program and Codex with manually edits
 # ============================================================================
 
 

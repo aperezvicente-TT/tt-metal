@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include "tt-metalium/core_coord.hpp"
 #include "ttnn/operations/eltwise/unary/common/unary_op_types.hpp"
 
@@ -72,12 +74,21 @@ struct MatmulMultiCoreReuseMultiCast1DProgramConfig {
     bool stream_in1 = false;
 };
 
+// Placement of the DRAM-sharded matmul's bank readers.
+// NOC_HOPS: each bank's primary is the first device's optimal reader; extra readers (num_workers_per_dram_bank > 1)
+//   take the free core with the fewest NOC_0 hops to the primary.
+// ROW_PLUS_X: as NOC_HOPS, but an extra reader takes the nearest free core at x+1..x+4 in its primary's row.
+// MESH_ROW_PLUS_X: as ROW_PLUS_X, with each bank's primary chosen among the local devices' optimal readers to
+//   minimize the worst NOC_0 hop count from any device's optimal reader (meshes of differently harvested dies).
+enum class DramReaderPlacement : uint8_t { NOC_HOPS = 0, ROW_PLUS_X = 1, MESH_ROW_PLUS_X = 2 };
+
 struct MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig {
     std::size_t in0_block_w{};
     std::size_t per_core_M{};
     std::size_t per_core_N{};
     std::optional<ttnn::operations::unary::UnaryWithParam> fused_activation;
     std::size_t num_workers_per_dram_bank = 1;
+    DramReaderPlacement dram_reader_placement = DramReaderPlacement::NOC_HOPS;
 };
 
 struct MatmulMultiCoreReuseMultiCastBatchedDRAMShardedProgramConfig {

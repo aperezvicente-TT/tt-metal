@@ -127,6 +127,8 @@ void kernel_main() {
     constexpr uint32_t cb_k_latent_tile = get_compile_time_arg_val(sparse_sdpa::compute_ct_arg::CB_K_LATENT_TILE);
     constexpr uint32_t cb_k_rope_tile = get_compile_time_arg_val(sparse_sdpa::compute_ct_arg::CB_K_ROPE_TILE);
 
+    constexpr bool emit_stats = get_compile_time_arg_val(sparse_sdpa::compute_ct_arg::EMIT_STATS) != 0;
+    constexpr uint32_t cb_stats = get_compile_time_arg_val(sparse_sdpa::compute_ct_arg::CB_STATS);
     constexpr uint32_t qsb =
         get_compile_time_arg_val(sparse_sdpa::compute_ct_arg::QUERY_SUBBLOCK);  // query tile-rows per DST group
     constexpr uint32_t packed_row_bytes = get_compile_time_arg_val(sparse_sdpa::compute_ct_arg::PACKED_ROW_BYTES);
@@ -492,6 +494,48 @@ void kernel_main() {
             out_cur.push_back(Sqt * vDHt);
 
             if (is_last) {
+                if constexpr (emit_stats) {
+                    // Split-K statistics (SparseSDPAParams::emit_stats): the running max (max_cur: column 0 of each
+                    // row = the UNSCALED score max of that head) and the finalised row-sum (sum_cur's partial
+                    // per-column sums reduced against the col-identity, as normalize_row_streaming does) -> cb_stats
+                    // as fp32 tiles: Sqt max tiles, then Sqt sum tiles. Reads max_cur / sum_cur non-destructively
+                    // (no pop: normalize_row_streaming consumes them next); its own tile_regs acquire / release per
+                    // tile; the fp32 pack format is restored to the bf16 scratch format before normalize (whose
+                    // sdpa_maybe_pack_reconfig_data_format<out_im, scratch> folds away for equal bf16 formats and
+                    // would otherwise inherit the fp32 packer state).
+                    CircularBuffer stats_cb(cb_stats);
+                    stats_cb.reserve_back(2 * Sqt);
+                    pack_reconfig_data_format(cb_stats);
+                    configure_single_tile_pack(cb_stats);
+                    max_cur.wait_front(Sqt);
+                    reconfig_data_format_srca(max_cur.get_cb_id());
+                    // the STANDARD copy (no in-face transpose): sdpa_reduce_copy_tile_to_dst_init_short transposes
+                    // within each 16x16 face (the reduce path's convention), which moved the column-0 maxes into row 0
+                    // of each face -- the writer then read heads 0 / 16 right and garbage for the rest (2026-10-24)
+                    copy_tile_to_dst_init_short(max_cur.get_cb_id());
+                    for (uint32_t s = 0; s < Sqt; ++s) {
+                        tile_regs_acquire();
+                        copy_tile(max_cur.get_cb_id(), s, 0);
+                        tile_regs_commit();
+                        tile_regs_wait();
+                        pack_tile(0, cb_stats);
+                        tile_regs_release();
+                    }
+                    sum_cur.wait_front(Sqt);
+                    CircularBuffer(cb_col_identity).wait_front(1);
+                    reconfig_data_format(sum_cur.get_cb_id(), cb_col_identity);
+                    matmul_block_init(sum_cur.get_cb_id(), cb_col_identity, 0, 1, 1, 1);
+                    for (uint32_t s = 0; s < Sqt; ++s) {
+                        tile_regs_acquire();
+                        matmul_block(sum_cur.get_cb_id(), cb_col_identity, s, 0, 0, 0, 1, 1, 1);
+                        tile_regs_commit();
+                        tile_regs_wait();
+                        pack_tile(0, cb_stats);
+                        tile_regs_release();
+                    }
+                    stats_cb.push_back(2 * Sqt);
+                    pack_reconfig_data_format(cb_recip_scratch);  // back to the bf16 intermediates
+                }
                 // Finalize: row-sum (matmul vs col-identity) -> recip -> out *= 1/sum -> cb_out_im.
                 // normalize_row_streaming is DST-safe for any sbh, so it does all Sqt rows in one call.
                 normalize_row_streaming<

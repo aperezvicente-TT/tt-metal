@@ -84,8 +84,10 @@ Blocking::Blocking(
     uint32_t out_tile_,
     bool enable_phase_alias_,
     bool x_is_rm_,
-    bool fuse_bias_) :
+    bool fuse_bias_,
+    bool gather_x_) :
     fuse_bias(fuse_bias_),
+    gather_x(gather_x_),
     hgroups(hgroups_),
     kgroups(kgroups_),
     num_cores(hgroups_ * kgroups_),
@@ -334,7 +336,9 @@ std::vector<CbView> Blocking::cb_layout(
         {CB_W_DOWN, depth_wd * hn_pad * wd_ec_max, w_tile, FormatKey::Weight},
         {CB_H, depth_h * h_fast, bfp8_tile, FormatKey::Bfp8},
         {CB_IDX_SCRATCH, 1, idx_page, FormatKey::U32},
-        {CB_COUNTS_SCRATCH, 1, counts_page, FormatKey::U32},
+        // two 64-B-aligned pages: the counts and the region starts, both read ONCE per call by the reader (the tables
+        // are identical for every expert; a Blackhole DRAM read needs a 64-B-aligned L1 destination)
+        {CB_COUNTS_SCRATCH, 2, (counts_page + 63) / 64 * 64, FormatKey::U32},
         {CB_GATHER_GATE, gather_pages, bfp8_tile, FormatKey::Bfp8},
         {CB_GATHER_UP, gather_pages, bfp8_tile, FormatKey::Bfp8},
         {CB_SLICE_GATE, slice_pages, bf16_tile, FormatKey::Bf16},
@@ -357,6 +361,12 @@ std::vector<CbView> Blocking::cb_layout(
         views.push_back({CB_GATE_BIAS, hn_pad, bf16_tile, FormatKey::Bf16});
         views.push_back({CB_UP_BIAS, hn_pad, bf16_tile, FormatKey::Bf16});
         views.push_back({CB_DOWN_BIAS, ec_max, bf16_tile, FormatKey::Bf16});
+    }
+    // Gathered x read: one expert's x_row_index slice, read whole in phase 0 -- M_T_MAX tile-rows of TILE uint32
+    // row ids. 128 B per tile-row, so the size stays a multiple of the DRAM alignment and keeps every CB after it
+    // aligned. Sized from m_t_max, the same bound the reader clamps every region to, so the read always fits.
+    if (gather_x) {
+        views.push_back({CB_X_ROW_INDEX, 1, m_t_max * TILE * static_cast<uint32_t>(sizeof(uint32_t)), FormatKey::U32});
     }
     return views;
 }
@@ -452,6 +462,9 @@ std::string Blocking::describe() const {
            << ", hn_pad " << hn_pad << ", gu_chunks " << gu_chunks << ", ec_max " << ec_max << ", depth_wd " << depth_wd
            << ", depth_x " << depth_x << ", depth_h " << depth_h << ", wd_split " << wd_split << ", wd_mrow "
            << (wd_mrow_rounds && wd_resident);
+    if (gather_x) {
+        stream << ", gather_x (index scratch " << m_t_max * TILE * sizeof(uint32_t) << " B)";
+    }
     return stream.str();
 }
 

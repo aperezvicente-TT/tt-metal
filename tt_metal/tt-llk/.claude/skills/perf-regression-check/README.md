@@ -21,7 +21,7 @@ $S wormhole  perf_math_matmul --baseline 1a2b3c4 --current 9f8e7d6   # two hashe
 $S blackhole perf_math_matmul --baseline HEAD~5 --dry-run       # what would it measure?
 ```
 
-In Claude Code, `/perf-regression-check perf_math_matmul` (or "compare perf of
+In the program, `/perf-regression-check perf_math_matmul` (or "compare perf of
 `perf_math_matmul` between abc123 and def456") drives the same script.
 
 ## Options

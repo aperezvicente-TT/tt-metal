@@ -168,11 +168,22 @@ void MoeFusedSwiGluDeviceOperation::validate_on_program_cache_miss(
         "moe_fused_swiglu: gate K ({}) must equal activation embedding ({})",
         gate_shape[-2],
         activation_shape[-1]);
+    const uint32_t gate_up_width = operation_arguments.gate_up_interleaved ? 2 * down_shape[-2] : down_shape[-2];
     TT_FATAL(
-        down_shape[-2] == gate_shape[-1],
-        "moe_fused_swiglu: down K ({}) must equal gate/up hidden ({})",
+        gate_up_width == gate_shape[-1],
+        "moe_fused_swiglu: gate/up width ({}) must equal {} down K ({}){}",
+        gate_shape[-1],
+        operation_arguments.gate_up_interleaved ? "2 x" : "",
         down_shape[-2],
-        gate_shape[-1]);
+        operation_arguments.gate_up_interleaved ? " (gate_up_interleaved)" : "");
+    if (operation_arguments.gate_up_interleaved) {
+        for (uint32_t e = 0; e < operation_arguments.experts_per_chip; ++e) {
+            TT_FATAL(
+                tensor_arguments.w_gates[e].buffer()->address() == tensor_arguments.w_ups[e].buffer()->address(),
+                "moe_fused_swiglu: gate_up_interleaved needs w_gates[{0}] and w_ups[{0}] to be the same tensor",
+                e);
+        }
+    }
     TT_FATAL(
         down_shape[-1] == activation_shape[-1],
         "moe_fused_swiglu: down N ({}) must equal activation embedding ({})",
@@ -197,12 +208,58 @@ void MoeFusedSwiGluDeviceOperation::validate_on_program_cache_miss(
         "moe_fused_swiglu: experts_per_chip {} exceeds idx table length {}",
         operation_arguments.experts_per_chip,
         tensor_arguments.global_expert_idx_table.logical_shape()[-1]);
+    // Gathered x read. The region space -- what expert_region_offsets index, what input_m_tiles and the shared
+    // output must cover -- becomes x_row_index's length; the activations only have to hold every index VALUE.
+    // The kernel cannot check those values (they are device-produced), so it clamps each one to the last
+    // activation row: an out-of-range index reads a wrong-but-allocated row, never outside the buffer.
+    const bool gather_x = tensor_arguments.x_row_index.has_value();
+    TT_FATAL(
+        operation_arguments.gather_x == gather_x,
+        "moe_fused_swiglu: gather_x ({}) must match the presence of x_row_index ({})",
+        operation_arguments.gather_x,
+        gather_x);
+    uint32_t region_rows = tensor_arguments.activations.padded_shape()[-2];
+    if (gather_x) {
+        const auto& x_row_index = *tensor_arguments.x_row_index;
+        validate_device_tensor(x_row_index, "x_row_index");
+        TT_FATAL(
+            x_row_index.device() == tensor_arguments.activations.device(),
+            "moe_fused_swiglu: x_row_index must use the activations device");
+        TT_FATAL(
+            x_row_index.dtype() == tt::tt_metal::DataType::UINT32 &&
+                x_row_index.layout() == tt::tt_metal::Layout::ROW_MAJOR && is_dram_interleaved(x_row_index),
+            "moe_fused_swiglu: x_row_index must be UINT32 ROW_MAJOR DRAM interleaved (got dtype {}, layout {})",
+            x_row_index.dtype(),
+            x_row_index.layout());
+        // ONE page: the reader fetches a region's slice of it at a byte offset into page 0.
+        const auto& index_shape = x_row_index.logical_shape();
+        bool one_row = index_shape.rank() >= 1 && index_shape.rank() <= 4;
+        for (int dim = 0; one_row && dim + 1 < static_cast<int>(index_shape.rank()); ++dim) {
+            one_row = index_shape[dim] == 1;
+        }
+        TT_FATAL(
+            one_row && index_shape[-1] > 0,
+            "moe_fused_swiglu: x_row_index must be one non-empty row ([N], [1, N] or [1, 1, 1, N]), got {}",
+            index_shape);
+        TT_FATAL(
+            index_shape[-1] % TILE == 0,
+            "moe_fused_swiglu: x_row_index length {} must be tile-aligned",
+            index_shape[-1]);
+        TT_FATAL(
+            operation_arguments.read_x_at_offset,
+            "moe_fused_swiglu: x_row_index requires read_x_at_offset (and so expert_region_offsets)");
+        TT_FATAL(
+            activations_are_row_major,
+            "moe_fused_swiglu: x_row_index requires BFLOAT16 ROW_MAJOR activations (one stick per input row)");
+        region_rows = index_shape[-1];
+    }
     TT_FATAL(operation_arguments.m_tiles > 0, "moe_fused_swiglu: input_m_tiles must be positive");
     TT_FATAL(
-        operation_arguments.m_tiles <= tensor_arguments.activations.padded_shape()[-2] / TILE,
-        "moe_fused_swiglu: input_m_tiles {} exceeds activation capacity {} tiles",
+        operation_arguments.m_tiles <= region_rows / TILE,
+        "moe_fused_swiglu: input_m_tiles {} exceeds {} capacity {} tiles",
         operation_arguments.m_tiles,
-        tensor_arguments.activations.padded_shape()[-2] / TILE);
+        gather_x ? "x_row_index" : "activation",
+        region_rows / TILE);
     // An inverted band drops every expert down the same count-0 path a genuine skip takes, so the
     // op would run to completion and write nothing rather than fail.
     TT_FATAL(
@@ -226,9 +283,16 @@ void MoeFusedSwiGluDeviceOperation::validate_on_program_cache_miss(
     TT_FATAL(
         operation_arguments.activation == RoutedExpertActivation::Silu ||
             operation_arguments.activation == RoutedExpertActivation::SituGlu ||
-            operation_arguments.activation == RoutedExpertActivation::SwiGluOai,
+            operation_arguments.activation == RoutedExpertActivation::SwiGluOai ||
+            operation_arguments.activation == RoutedExpertActivation::ClampedSiluGlu,
         "moe_fused_swiglu: activation must be RoutedExpertActivation::Silu, "
-        "RoutedExpertActivation::SituGlu or RoutedExpertActivation::SwiGluOai");
+        "RoutedExpertActivation::SituGlu, RoutedExpertActivation::SwiGluOai or "
+        "RoutedExpertActivation::ClampedSiluGlu");
+    TT_FATAL(
+        operation_arguments.activation != RoutedExpertActivation::ClampedSiluGlu ||
+            (tensor_arguments.activations.device()->arch() == tt::ARCH::BLACKHOLE &&
+             tensor_arguments.gate_biases.empty()),
+        "moe_fused_swiglu: ClampedSiluGlu is Blackhole-only and bias-free");
     // All three or none: biasing some projections and not others is wrong numbers with no error.
     const auto& gate_biases = tensor_arguments.gate_biases;
     const auto& up_biases = tensor_arguments.up_biases;
@@ -347,11 +411,13 @@ void MoeFusedSwiGluDeviceOperation::validate_on_program_cache_miss(
             activation_shape[-1]);
         TT_FATAL(output.logical_shape()[-2] % TILE == 0, "moe_fused_swiglu: output rows must be tile-aligned");
         if (direct_write) {
+            // The output mirrors the REGION space: the activation rows, or x_row_index's length when gathering.
             TT_FATAL(
-                output.logical_shape()[-2] >= activation_shape[-2],
-                "moe_fused_swiglu: shared output rows {} must be >= activation rows {}",
+                output.logical_shape()[-2] >= region_rows,
+                "moe_fused_swiglu: shared output rows {} must be >= {} rows {}",
                 output.logical_shape()[-2],
-                activation_shape[-2]);
+                gather_x ? "x_row_index" : "activation",
+                region_rows);
         } else {
             TT_FATAL(
                 output.logical_shape() == activation_shape,
@@ -378,6 +444,11 @@ void MoeFusedSwiGluDeviceOperation::validate_on_program_cache_miss(
             TT_FATAL(
                 output.buffer()->address() != tensor_arguments.expert_region_offsets->buffer()->address(),
                 "moe_fused_swiglu: output must not alias expert_region_offsets");
+        }
+        if (gather_x) {
+            TT_FATAL(
+                output.buffer()->address() != tensor_arguments.x_row_index->buffer()->address(),
+                "moe_fused_swiglu: output must not alias x_row_index");
         }
     }
 }
@@ -446,7 +517,10 @@ ttnn::Tensor moe_fused_swiglu(
     const std::optional<ttnn::Tensor>& optional_output,
     const std::optional<ttnn::Tensor>& expert_region_offsets,
     uint32_t min_active_tokens,
-    uint32_t max_active_tokens) {
+    uint32_t max_active_tokens,
+    bool gate_up_interleaved,
+    uint32_t l1_budget_bytes,
+    const std::optional<ttnn::Tensor>& x_row_index) {
     using OperationType = operations::experimental::deepseek_prefill::moe_fused_swiglu::MoeFusedSwiGluDeviceOperation;
     return ttnn::device_operation::launch<OperationType>(
         OperationType::operation_attributes_t{
@@ -461,6 +535,10 @@ ttnn::Tensor moe_fused_swiglu(
             // One flag rather than three: the all-or-none invariant is validated below, so the
             // kernels only need to know whether the bias adds are compiled in at all.
             .fuse_bias = !gate_biases.empty(),
+            .gate_up_interleaved = gate_up_interleaved,
+            .l1_budget_bytes = l1_budget_bytes,
+            // Like fuse_bias: one hashed flag derived from the tensor's presence (validated to agree).
+            .gather_x = x_row_index.has_value(),
             .output_dtype = output_dtype,
             .output_memory_config = output_memory_config,
             .compute_kernel_config = compute_kernel_config},
@@ -475,7 +553,8 @@ ttnn::Tensor moe_fused_swiglu(
             .counts = counts,
             .global_expert_idx_table = global_expert_idx_table,
             .optional_output = optional_output,
-            .expert_region_offsets = expert_region_offsets});
+            .expert_region_offsets = expert_region_offsets,
+            .x_row_index = x_row_index});
 }
 
 }  // namespace ttnn::prim

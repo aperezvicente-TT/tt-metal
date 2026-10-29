@@ -432,6 +432,31 @@ void bind_sdpa(nb::module_& mod) {
         nb::arg("block_cyclic_cache_tp_sharded") = false,
         nb::arg("attention_sink") = nb::none());
 
+    ttnn::bind_function<"sparse_sdpa_stats", "ttnn.transformer.">(
+        mod,
+        R"doc(
+        sparse_sdpa with the split-K statistics: returns [out, stats]. out as sparse_sdpa's; stats [1, 1, S, 2 H] fp32
+        ROW_MAJOR = per token [m_0 .. m_H-1, l_0 .. l_H-1], m = the UNSCALED score max over the keys attended by that
+        head, l = sum exp((s - m) scale). The owner of a head merges the partials of C devices with M = max_c m_c,
+        w_c = exp((m_c - M) scale) l_c / sum_c' exp((m_c' - M) scale) l_c', o = sum_c w_c o_c (the sequence-sharded
+        DSA prefill, lever B-q). Same arguments as sparse_sdpa; the single-output op is unchanged.
+        )doc",
+        &ttnn::transformer::sparse_sdpa_stats,
+        nb::arg("q").noconvert(),
+        nb::arg("kv").noconvert(),
+        nb::arg("indices").noconvert(),
+        nb::arg("v_dim"),
+        nb::kw_only(),
+        nb::arg("kv_format"),
+        nb::arg("scale") = nb::none(),
+        nb::arg("k_chunk_size") = 128,
+        nb::arg("compute_kernel_config") = nb::none(),
+        nb::arg("cache_batch_idx") = nb::none(),
+        nb::arg("block_cyclic_sp_axis") = nb::none(),
+        nb::arg("block_cyclic_chunk_local") = nb::none(),
+        nb::arg("block_cyclic_cache_tp_sharded") = false,
+        nb::arg("attention_sink") = nb::none());
+
     ttnn::bind_function<"sparse_sdpa_msa", "ttnn.transformer.">(
         mod,
         R"doc(

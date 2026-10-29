@@ -94,4 +94,27 @@ struct WeightRuns {
     }
 };
 
+// The gate|up tile-interleaved weight (MOE_GU_INTERLEAVED): ONE [emb, 2 * hidden] tensor per expert whose
+// tile columns are [gate_0 | up_0 | gate_1 | up_1 | ...]. A caller addresses the LOGICAL gate (PARITY 0) or
+// up (PARITY 1) matrix exactly as for a separate [emb, hidden] tensor -- page_row_base = k * hidden_tiles,
+// columns j in [j0, jend) -- and each logical page (k, j) is fused page (k, 2 j + PARITY): row base doubled,
+// one transaction per tile (consecutive logical columns are two fused pages apart).
+template <uint32_t PARITY>
+struct InterleavedRuns {
+    template <class Acc>
+    static FORCE_INLINE void read(
+        const Acc& acc, uint32_t page_row_base, uint32_t j0, uint32_t jend, uint32_t l1_base, uint32_t page_bytes) {
+        Noc noc;
+        uint32_t off = 0;
+        for (uint32_t j = j0; j < jend; ++j, ++off) {
+            noc.async_read(
+                acc,
+                CoreLocalMem<uint32_t>(l1_base + off * page_bytes),
+                page_bytes,
+                {.page_id = 2 * page_row_base + 2 * j + PARITY},
+                {});
+        }
+    }
+};
+
 }  // namespace moe_fused_swiglu

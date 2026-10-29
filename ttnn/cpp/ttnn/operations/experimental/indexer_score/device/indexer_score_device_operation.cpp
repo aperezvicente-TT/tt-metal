@@ -292,26 +292,33 @@ void validate_chunk_start_metadata(const operation_attributes_t& attrs, const te
     if (!t.has_chunk_start_metadata()) {
         return;
     }
-    // Fused-only for now: the classic (unfused) factory still bakes the causal fields as host runtime args.
-    TT_FATAL(
-        attrs.has_fused_ring(),
-        "indexer_score: chunk_start_idx_tensor is supported only on the fused ring path "
-        "(ring_indexer_score_dsa); the classic factory has no on-device metadata read");
     // kv_len is derived from chunk_start_idx_tensor on-device.
     TT_FATAL(
         !attrs.kv_len.has_value(),
         "indexer_score: kv_len must not be set alongside chunk_start_idx_tensor -- on the metadata path it is "
-        "derived on-device as chunk_start_idx + sp*chunk_local (exactly what the scalar path passes)");
-    // The derivation needs the slab geometry, which only the block-cyclic layout carries.
-    TT_FATAL(
-        attrs.has_block_cyclic(),
-        "indexer_score: chunk_start_idx_tensor requires the block-cyclic layout (block_cyclic_chunk_local), "
-        "whose sp/chunk_local are what the kernel derives kv_len and the causal rotation from");
-    TT_FATAL(
-        attrs.key_compression_ratio == 1,
-        "indexer_score: chunk_start_idx_tensor / valid_end_tensor support key_compression_ratio 1 only (got {}); "
-        "the valid_end cap and the fused all-gather extent are still in token units",
-        attrs.key_compression_ratio);
+        "derived on-device (fused: chunk_start_idx + sp*chunk_local; classic: this device's causal end)");
+    if (attrs.has_fused_ring()) {
+        // The fused derivation needs the slab geometry, which only the block-cyclic layout carries.
+        TT_FATAL(
+            attrs.has_block_cyclic(),
+            "indexer_score: chunk_start_idx_tensor requires the block-cyclic layout (block_cyclic_chunk_local), "
+            "whose sp/chunk_local are what the kernel derives kv_len and the causal rotation from");
+        TT_FATAL(
+            attrs.key_compression_ratio == 1,
+            "indexer_score: chunk_start_idx_tensor / valid_end_tensor support key_compression_ratio 1 only (got {}); "
+            "the valid_end cap and the fused all-gather extent are still in token units",
+            attrs.key_compression_ratio);
+    } else {
+        // Classic path: the reader derives chunk_start_tiles exactly as device_causal_geometry's contiguous branch
+        // (chunk_start + rank*Sq) and kv_len as this device's causal end ceil((chunk_start + (rank + 1) Sq) /
+        // (32 ratio)) compressed tiles -- contiguous K only (no slab rotation), any compression ratio; valid_end
+        // stays fused-only (a padded chunk's bound is still exact for its real rows).
+        TT_FATAL(
+            !attrs.has_block_cyclic(),
+            "indexer_score: chunk_start_idx_tensor on the classic path requires contiguous K (no block-cyclic layout)");
+        TT_FATAL(
+            !t.has_valid_end_metadata(), "indexer_score: valid_end_tensor is supported only on the fused ring path");
+    }
 
     validate_scalar_metadata_tensor(*t.chunk_start_idx_tensor, t.q, "chunk_start_idx_tensor");
 }
@@ -684,6 +691,20 @@ void IndexerScoreDeviceOperation::validate_on_program_cache_miss(
     TT_FATAL(KC > 0 && KC <= T / tt::constants::TILE_WIDTH, "k_chunk_size {} out of range (T={})", cfg.k_chunk_size, T);
     // KC need not divide Tt: the last unit is then partial (compute runs a full KC strip, writer clips).
     TT_FATAL(HB > 0 && Hi % HB == 0, "head_group_size {} must divide Hi {}", HB, Hi);
+    if (cfg.serial_head_reduce) {
+        TT_FATAL(
+            !attrs.has_fused_ring() && attrs.num_groups == 1,
+            "serial_head_reduce (the exact per-head reduction) is wired for the classic factory with one output plane "
+            "only (fused ring {}, num_groups {})",
+            attrs.has_fused_ring(),
+            attrs.num_groups);
+        const uint32_t sph = cfg.serial_pass_heads;
+        TT_FATAL(
+            sph >= 1 && sph <= 8 && HB % sph == 0,
+            "serial_pass_heads {} must be in [1, 8] (half-sync DEST) and divide the resident head group {}",
+            sph,
+            HB);
+    }
 
     // num_groups: 1 sums all heads (DSA/GLM); G>1 emits G per-group planes (M3). G>1 reuses the all-resident
     // full-strip path one group at a time (the streaming/per-column fallback is not wired for groups).
@@ -1176,7 +1197,8 @@ ttnn::Tensor indexer_score_dsa(
     const std::optional<std::vector<uint32_t>>& seq_shard_axes,
     std::optional<uint32_t> block_cyclic_sp_axis,
     std::optional<uint32_t> block_cyclic_chunk_local,
-    bool block_cyclic_cache_tp_sharded) {
+    bool block_cyclic_cache_tp_sharded,
+    const std::optional<ttnn::Tensor>& chunk_start_idx_tensor) {
     // DSA/GLM: relu, learned per-head gates, one head-summed plane, no pooling. Reads its real weights tensor.
     return launch_indexer_score(
         q,
@@ -1197,7 +1219,10 @@ ttnn::Tensor indexer_score_dsa(
         /*allow_subshard=*/true,
         block_cyclic_sp_axis,
         block_cyclic_chunk_local,
-        block_cyclic_cache_tp_sharded);
+        block_cyclic_cache_tp_sharded,
+        /*k_local=*/std::nullopt,
+        /*fused_ring=*/std::nullopt,
+        chunk_start_idx_tensor);
 }
 
 ttnn::Tensor indexer_score_msa(

@@ -10,7 +10,8 @@
 
 namespace ttnn::transformer {
 
-ttnn::Tensor sparse_sdpa(
+namespace {
+std::vector<ttnn::Tensor> sparse_sdpa_impl(
     const ttnn::Tensor& q,
     const ttnn::Tensor& kv,
     const ttnn::Tensor& indices,
@@ -23,7 +24,8 @@ ttnn::Tensor sparse_sdpa(
     std::optional<uint32_t> block_cyclic_sp_axis,
     std::optional<uint32_t> block_cyclic_chunk_local,
     bool block_cyclic_cache_tp_sharded,
-    const std::optional<ttnn::Tensor>& attention_sink) {
+    const std::optional<ttnn::Tensor>& attention_sink,
+    bool emit_stats) {
     const uint32_t k_dim = q.logical_shape()[3];  // head dim, from the tensor
     const float resolved_scale = scale.value_or(1.0f / std::sqrt(static_cast<float>(k_dim)));
 
@@ -94,7 +96,49 @@ ttnn::Tensor sparse_sdpa(
         kernel_config,
         cache_batch_idx,
         block_cyclic,
-        attention_sink);
+        attention_sink,
+        emit_stats);
+}
+}  // namespace
+
+ttnn::Tensor sparse_sdpa(
+    const ttnn::Tensor& q,
+    const ttnn::Tensor& kv,
+    const ttnn::Tensor& indices,
+    uint32_t v_dim,
+    SparseKVFormat kv_format,
+    std::optional<float> scale,
+    uint32_t k_chunk_size,
+    std::optional<ttnn::DeviceComputeKernelConfig> compute_kernel_config,
+    std::optional<uint32_t> cache_batch_idx,
+    std::optional<uint32_t> block_cyclic_sp_axis,
+    std::optional<uint32_t> block_cyclic_chunk_local,
+    bool block_cyclic_cache_tp_sharded,
+    const std::optional<ttnn::Tensor>& attention_sink) {
+    return sparse_sdpa_impl(
+        q, kv, indices, v_dim, kv_format, scale, k_chunk_size, compute_kernel_config, cache_batch_idx,
+        block_cyclic_sp_axis, block_cyclic_chunk_local, block_cyclic_cache_tp_sharded, attention_sink,
+        /*emit_stats=*/false)[0];
+}
+
+std::vector<ttnn::Tensor> sparse_sdpa_stats(
+    const ttnn::Tensor& q,
+    const ttnn::Tensor& kv,
+    const ttnn::Tensor& indices,
+    uint32_t v_dim,
+    SparseKVFormat kv_format,
+    std::optional<float> scale,
+    uint32_t k_chunk_size,
+    std::optional<ttnn::DeviceComputeKernelConfig> compute_kernel_config,
+    std::optional<uint32_t> cache_batch_idx,
+    std::optional<uint32_t> block_cyclic_sp_axis,
+    std::optional<uint32_t> block_cyclic_chunk_local,
+    bool block_cyclic_cache_tp_sharded,
+    const std::optional<ttnn::Tensor>& attention_sink) {
+    return sparse_sdpa_impl(
+        q, kv, indices, v_dim, kv_format, scale, k_chunk_size, compute_kernel_config, cache_batch_idx,
+        block_cyclic_sp_axis, block_cyclic_chunk_local, block_cyclic_cache_tp_sharded, attention_sink,
+        /*emit_stats=*/true);
 }
 
 }  // namespace ttnn::transformer

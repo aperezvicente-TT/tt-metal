@@ -52,7 +52,17 @@ ttnn::Tensor moe_fused_swiglu(
     // dropped like a zero count. Wide open by default; a hybrid dispatch narrows it so this
     // op and unified_routed_expert_moe split the experts by load over ONE counts vector.
     uint32_t min_active_tokens = 0,
-    uint32_t max_active_tokens = std::numeric_limits<uint32_t>::max());
+    uint32_t max_active_tokens = std::numeric_limits<uint32_t>::max(),
+    // w_gates[e] == w_ups[e] = one [emb, 2 * hidden] tensor with tile-interleaved gate|up columns
+    // (see OperationArguments::gate_up_interleaved).
+    bool gate_up_interleaved = false,
+    // static CB bytes per core the op may use (0: the whole unreserved worker L1); see OperationArguments
+    uint32_t l1_budget_bytes = 0,
+    // Gathered x read: UINT32 ROW_MAJOR one-row [N] / [1, N] / [1, 1, 1, N] DRAM-interleaved table. With
+    // read_x_at_offset and BF16 ROW_MAJOR activations, dispatch row d of an expert's region reads activations
+    // row x_row_index[d] (clamped to the last activation row) instead of row d, so `activations` can be the
+    // undispatched token rows. N becomes the region space (offsets, input_m_tiles default, output rows).
+    const std::optional<ttnn::Tensor>& x_row_index = std::nullopt);
 
 }  // namespace ttnn::operations::experimental::deepseek_prefill::moe_fused_swiglu
 

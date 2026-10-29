@@ -145,7 +145,9 @@ void py_module(nb::module_& mod) {
         nb::arg("memory_config") = nb::none(),
         nb::kw_only(),
         nb::arg("queue_id") = nb::none(),
-        nb::keep_alive<0, 2>(),  // test
+        nb::keep_alive<0, 2>(),                    // test
+        nb::call_guard<nb::gil_scoped_release>(),  // blocking host->device copy: other host threads may drive other
+                                                   // devices
         R"doc(
             Copy tensor from host to device.
 
@@ -333,6 +335,8 @@ void py_module(nb::module_& mod) {
         nb::arg("host_tensor"),
         nb::arg("device_tensor"),
         nb::arg("cq_id") = nb::none(),
+        nb::call_guard<nb::gil_scoped_release>(),  // blocking host->device copy: other host threads may drive other
+                                                   // devices
         R"doc(
         Copies a tensor from host to device.
 

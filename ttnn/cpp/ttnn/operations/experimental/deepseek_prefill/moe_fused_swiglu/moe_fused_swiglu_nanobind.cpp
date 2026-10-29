@@ -43,6 +43,17 @@ void bind_moe_fused_swiglu(nb::module_& mod) {
         BFLOAT8_B TILE in DRAM. By default all cores in the device's
         compute-with-storage grid are used. ``core_grid=(x, y)`` is an explicit
         rectangular-prefix override.
+
+        ``x_row_index`` (optional, default None = unchanged behaviour) is a UINT32
+        ROW_MAJOR DRAM-interleaved single-row table ``[N]``, ``[1, N]`` or
+        ``[1, 1, 1, N]`` (N tile-aligned). It requires ``read_x_at_offset=True``
+        and BFLOAT16 ROW_MAJOR input: dispatch row ``d`` of an expert's region then
+        reads its activation from ``input`` row ``x_row_index[d]`` instead of row
+        ``d``, so ``input`` can be the undispatched token rows and the dispatch
+        gather is skipped. ``N`` is the region space: ``expert_region_offsets``
+        index it, ``input_m_tiles`` defaults to ``N / 32`` and the output must have
+        at least ``N`` rows. Index values are device data the host cannot check;
+        the kernel clamps each one to the last ``input`` row.
         )doc",
         &moe_fused_swiglu,
         nb::arg("input").noconvert(),
@@ -65,7 +76,10 @@ void bind_moe_fused_swiglu(nb::module_& mod) {
         nb::arg("up_biases") = nb::none(),
         nb::arg("down_biases") = nb::none(),
         nb::arg("min_active_tokens") = 0,
-        nb::arg("max_active_tokens") = std::numeric_limits<uint32_t>::max());
+        nb::arg("max_active_tokens") = std::numeric_limits<uint32_t>::max(),
+        nb::arg("gate_up_interleaved") = false,
+        nb::arg("l1_budget_bytes") = 0,
+        nb::arg("x_row_index") = nb::none());
 }
 
 }  // namespace ttnn::operations::experimental::deepseek_prefill::moe_fused_swiglu::detail

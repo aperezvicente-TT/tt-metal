@@ -229,8 +229,8 @@ void kernel_main() {
         group_stride,
         {schedule_ring_size, schedule_units, 0, 0, schedule_blocks, schedule_cols, schedule_rotate});
     const uint32_t row_group0 = schedule.row_group;
-    const uint32_t band0 = schedule.band_start;
-    const uint32_t num_bands = schedule.band_count;
+    uint32_t band0 = schedule.band_start;
+    uint32_t num_bands = schedule.band_count;
     // The common valid length caps columns written per cell (full when unset).
     uint32_t kv_len_tiles = get_common_arg_val<uint32_t>(indexer_common::writer::KvLength);
     // Per-device chunk-start (tiles); runtime so distinct values reuse one program. Only the block-pool
@@ -260,6 +260,16 @@ void kernel_main() {
         straddle_q_tiles = bounds->straddle_q_tile;
         straddle_jump_tiles_rt = bounds->straddle_jump_tiles;
         wmeta.pop_front(1);
+        if constexpr (!fused_ring_enabled) {  // the kv-balanced split: the reader's and the compute's derivation
+            const auto kvs = indexer_schedule::for_core_kv(
+                core_id,
+                group_stride,
+                {schedule_ring_size, schedule_units, 0, 0, schedule_blocks, schedule_cols, schedule_rotate},
+                kv_len_tiles,
+                k_tiles_per_unit);
+            band0 = kvs.band_start;
+            num_bands = kvs.band_count;
+        }
     }
     const uint32_t chunk_start_keys = chunk_start_tiles * tt::constants::TILE_WIDTH;
     const uint32_t straddle_q_keys = straddle_q_tiles * tt::constants::TILE_WIDTH;

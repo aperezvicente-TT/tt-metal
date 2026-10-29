@@ -68,6 +68,9 @@ IndexerScoreProgramFactory::cached_program_t IndexerScoreProgramFactory::create_
     const uint32_t QC = cfg.q_chunk_size / tt::constants::TILE_HEIGHT;
     const uint32_t KC = cfg.k_chunk_size / tt::constants::TILE_WIDTH;
     const uint32_t HB = resolve_head_group(cfg, Hi);
+    // Exact per-head reduction (serial_head_reduce): one head per DEST pass, one head per gate MAC + L1-acc pack --
+    // the streaming default's instruction sequence per head -- with q / w resident (HB heads) across the bands.
+    const bool serial = cfg.serial_head_reduce;
 
     // num_groups: G==1 sums all heads (DSA/GLM); G>1 sums Hi/G heads per group into G planes (M3). The
     // subblock height and cb_qk batch key off the per-plane width: HB when G==1, plane_heads when G>1.
@@ -89,7 +92,8 @@ IndexerScoreProgramFactory::cached_program_t IndexerScoreProgramFactory::create_
     // qk matmul subblock: heads are output rows, k column is 1 tile wide, so only the subblock height matters.
     const uint32_t dst_size = fp32_dest_acc_en ? 4 : 8;  // half-sync, as in sdpa_program_factory
     const uint32_t qk_subblock_h =
-        ttnn::prim::detail::determine_largest_subblock_size(subblock_basis, 1, dst_size).first;
+        serial ? static_cast<uint32_t>(cfg.serial_pass_heads)
+               : ttnn::prim::detail::determine_largest_subblock_size(subblock_basis, 1, dst_size).first;
     TT_FATAL(
         subblock_basis % qk_subblock_h == 0,
         "per-plane head count {} must be divisible by qk_subblock_h={}",
@@ -214,7 +218,13 @@ IndexerScoreProgramFactory::cached_program_t IndexerScoreProgramFactory::create_
     const uint32_t acc_tile = fp32_dest_acc_en ? fp32_tile : bf16_tile;
     // cb_qk buffers a batch of relu(q.kT) tiles so compute runs the batch's matmuls then mul+accumulates,
     // hoisting the matmul<->eltwise reinit out of the per-head loop (shared with the fused factory).
-    const auto [qk_batch_heads, qk_col_batch] = dsa_qk_batching(subblock_basis, QC, KC, stream_heads);
+    auto batching = dsa_qk_batching(subblock_basis, QC, KC, stream_heads);
+    if (serial) {  // the per-column streaming fallback, one head per matmul / MAC step (see accumulate_heads)
+        batching.qk_batch_heads = 1;
+        batching.qk_col_batch = 1;
+    }
+    const uint32_t qk_batch_heads = batching.qk_batch_heads;
+    const uint32_t qk_col_batch = batching.qk_col_batch;
     // G>1 reuses the full-strip path (the fallback is not wired for groups); only fires if plane_heads
     // exceeds the batch cap (QC>1 with plane_heads>32).
     TT_FATAL(
@@ -224,7 +234,8 @@ IndexerScoreProgramFactory::cached_program_t IndexerScoreProgramFactory::create_
         plane_heads);
     // cb_qk stages the matmul output for the gate-mul phase; the fused path writes straight to the
     // accumulator, so cb_qk is unused there (1 tile, L1 spent on a deeper cb_out_strip).
-    make_cb(cb_qk_arg, fuse_single ? 1u : (qk_col_batch * qk_batch_heads), acc_fmt, acc_tile);
+    // serial: the matmul phase stages the whole resident group (HB tiles) before the per-head gate phase.
+    make_cb(cb_qk_arg, fuse_single ? 1u : serial ? HB : (qk_col_batch * qk_batch_heads), acc_fmt, acc_tile);
     // cb_out_strip holds the pooled/untilized output, normally double-buffered. The fused block-pool path
     // deepens it to the whole unit's blocks so the pool and writer decouple (no 2-row-ring mutual stall).
     const uint32_t out_strip_tiles =
@@ -239,6 +250,20 @@ IndexerScoreProgramFactory::cached_program_t IndexerScoreProgramFactory::create_
     // cb_acc_strip accumulates a whole unit's QC*KC strip, then untilizes under ONE pack_untilize bracket.
     // max(2*KC, .) keeps the QC<=2 double buffer and a whole multiple of QC*KC so a push never wraps mid-unit.
     make_cb(cb_acc_strip_arg, std::max(2u * KC, QC * KC), acc_fmt, acc_tile);
+    // Trace-safe chunk start (chunk_start_idx_tensor): the reader reads the device word, derives this device's causal
+    // geometry + kv_len, and publishes them through one single-consumer mailbox CB each to compute and the writer
+    // (the fused factory's discipline; 64-B UInt32 pages).
+    const bool has_meta = tensors.has_chunk_start_metadata();
+    uint32_t cb_meta_derived = 0, cb_meta_writer = 0;
+    if (has_meta) {
+        for (uint32_t* slot : {&cb_meta_derived, &cb_meta_writer}) {
+            *slot = next_cb_index++;
+            tt::tt_metal::CreateCircularBuffer(
+                program,
+                core_ranges,
+                tt::tt_metal::CircularBufferConfig(64, {{*slot, tt::DataFormat::UInt32}}).set_page_size(*slot, 64));
+        }
+    }
 
     // Common dimensions (including compressed-key ratio), then CB indices. chunk_t stays a runtime arg.
     std::vector<uint32_t> common_ct = {Hi, Sqt, Tt, Dt, QC, KC, HB, G, block_tiles, args.key_compression_ratio};
@@ -299,11 +324,17 @@ IndexerScoreProgramFactory::cached_program_t IndexerScoreProgramFactory::create_
     // build error in the kernel, not a default. Fixed width: flag, rt base, two CBs, Sq, rotation-exact
     // flag, then a placeholder accessor. Pushed AFTER partial readiness AND after #55617's physical SP
     // size, matching the reader's meta_ct_base.
-    reader_ct.push_back(0u);
-    // 6 zeros: rt base, two CBs, Sq, rotation-exact flag, key-stripe split. The split is only read on the
-    // metadata path (rejected here), so 0 is inert -- but the WIDTH must match the reader.
-    reader_ct.insert(reader_ct.end(), 6, 0u);
-    tt::tt_metal::TensorAccessorArgs(*q.buffer()).append_to(reader_ct);
+    // Classic metadata path: flag, rt base, the two mailbox CBs, Sq (the per-device causal end derivation), rotation
+    // off (contiguous K), split 1, then the device word's accessor. Off: the same fixed-width block, zero-filled.
+    reader_ct.push_back(has_meta ? 1u : 0u);
+    reader_ct.push_back(has_meta ? static_cast<uint32_t>(indexer_common::reader::ChunkMetadata) : 0u);
+    reader_ct.push_back(has_meta ? cb_meta_derived : 0u);
+    reader_ct.push_back(has_meta ? cb_meta_writer : 0u);
+    reader_ct.push_back(has_meta ? Sq : 0u);
+    reader_ct.push_back(0u);                  // rotation-exact geometry: never on contiguous K
+    reader_ct.push_back(has_meta ? 1u : 0u);  // key-stripe split (unsplit)
+    tt::tt_metal::TensorAccessorArgs(has_meta ? *tensors.chunk_start_idx_tensor->buffer() : *q.buffer())
+        .append_to(reader_ct);
     // Cache-slot metadata, same discipline minus the presence flag: rt base, pages-per-slot, mailbox CB,
     // cache extent, then a placeholder accessor.
     reader_ct.insert(reader_ct.end(), 4, 0u);
@@ -324,8 +355,9 @@ IndexerScoreProgramFactory::cached_program_t IndexerScoreProgramFactory::create_
     writer_ct.push_back(1u);  // unused logical key stripe count
     writer_ct.push_back(1u);  // unused physical SP size
     tt::tt_metal::TensorAccessorArgs(*out.buffer()).append_to(writer_ct);
-    writer_ct.push_back(0u);
-    writer_ct.push_back(0u);
+    writer_ct.push_back(
+        has_meta ? 1u : 0u);  // trace-safe metadata: the writer takes kv_len / geometry from the mailbox
+    writer_ct.push_back(has_meta ? cb_meta_writer : 0u);
 
     std::vector<uint32_t> compute_ct = common_ct;
     compute_ct.push_back(qk_subblock_h);
@@ -341,8 +373,9 @@ IndexerScoreProgramFactory::cached_program_t IndexerScoreProgramFactory::create_
     compute_ct.push_back(1u);                        // unused block-cyclic run width
     compute_ct.push_back(1u);                        // unused logical key stripe count
     compute_ct.push_back(1u);                        // unused physical SP size
-    compute_ct.push_back(0u);                        // trace-safe metadata off
-    compute_ct.push_back(0u);                        // metadata CB unused
+    compute_ct.push_back(has_meta ? 1u : 0u);        // trace-safe metadata: kv_len / geometry from the mailbox
+    compute_ct.push_back(has_meta ? cb_meta_derived : 0u);
+    compute_ct.push_back(serial ? 1u : 0u);  // exact per-head reduction (serial_head_reduce)
 
     const std::unordered_map<std::string, uint32_t> schedule_args{
         {"schedule_blocks", num_blocks},
@@ -383,6 +416,11 @@ IndexerScoreProgramFactory::cached_program_t IndexerScoreProgramFactory::create_
     const std::array<uint32_t, 6> reader_prefix = {
         q.buffer()->address(), k.buffer()->address(), w.buffer()->address(), 0u, k_batch_page_offset, kv_len_tiles};
     std::copy(reader_prefix.begin(), reader_prefix.end(), reader_values.begin());
+    if (has_meta) {  // the device word + the rank the reader's causal derivation uses (device_causal_geometry's)
+        reader_values[indexer_common::reader::ChunkMetadata] = tensors.chunk_start_idx_tensor->buffer()->address();
+        reader_values[indexer_common::reader::DeviceIndex] = device_index;
+        reader_values[indexer_common::reader::TpIndex] = tp_index;
+    }
     append_multicast_axes(reader_values, phys);
     tt::tt_metal::SetCommonRuntimeArgs(program, reader_id, reader_values);
     tt::tt_metal::SetCommonRuntimeArgs(
@@ -458,6 +496,11 @@ void IndexerScoreProgramFactory::override_runtime_arguments(
         const std::array<uint32_t, indexer_common::compute::Count> causal_values = {
             kv_len_tiles, geom.chunk_start_tiles, geom.straddle_q_tile, geom.straddle_jump_tiles};
         std::copy(reader_values.begin(), reader_values.end(), reader_args.data());
+        if (tensors.has_chunk_start_metadata()) {  // re-bind the device word; keep this coordinate's rank
+            reader_args[indexer_common::reader::ChunkMetadata] = tensors.chunk_start_idx_tensor->buffer()->address();
+            reader_args[indexer_common::reader::DeviceIndex] = shared.device_index;
+            reader_args[indexer_common::reader::TpIndex] = shared.tp_index;
+        }
         std::copy(causal_values.begin(), causal_values.end(), compute_args.data());
         writer_args[indexer_common::writer::Output] = out_address;
         std::copy(causal_values.begin(), causal_values.end(), writer_args.data() + indexer_common::writer::KvLength);

@@ -1038,7 +1038,7 @@ class WanResample(Module):
                 # cases not tested. It may also be we deliberately break compatibility against reference
                 # models for performance purposes. This needs to be audited.
                 #
-                # Claude was not able to reference this piece of code to any pat of the WanResample
+                # the program was not able to reference this piece of code to any pat of the WanResample
                 # code from hugging face's models, but the results pass for the test cases.
                 #
                 # TODO: Does the comment below 1) make sense? 2) convey the correct intention?
@@ -1948,7 +1948,7 @@ class WanEncoder(Module):
             # processed alone and cached (above), then iterate over groups of encoder_t_chunk_size (with 1 frame
             # in the chunk coming from the cache each time). Any trailing (T - 1) % chunk frames are dropped, because the
             # stride-2 downsample3d time_conv cannot form a valid temporal window from a partial tail.
-            # NOTE: This change was proposed by Claude, so feel free to double check the validity. Also
+            # NOTE: This change was proposed by the program, so feel free to double check the validity. Also
             # if we no longer intend to match exactly the reference behavior we should revisit this algorithm.
             num_chunks = (T - 1) // encoder_t_chunk_size
             dropped = (T - 1) - num_chunks * encoder_t_chunk_size

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a whole audit, wave after wave, in headless Claude sessions that cannot lose finished work. Launch it in
+"""Run a whole audit, wave after wave, in headless the program sessions that cannot lose finished work. Launch it in
 tmux or screen, so it survives the interactive session and a closed terminal.
 
   run_headless.py --run DIR [--wave-size 45] [--prios AB] [--second-pass] [--max-waves 0] [--max-attempts 12]

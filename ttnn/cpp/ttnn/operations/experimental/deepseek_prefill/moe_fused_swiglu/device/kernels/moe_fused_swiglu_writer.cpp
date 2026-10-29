@@ -163,7 +163,10 @@ inline void h_slot_send_posted_noc1(uint32_t slot, uint32_t l1, uint32_t size) {
     }
     hf.set(VALID);
     hf.set_multicast(noc, rb.sx, rb.sy, rb.ex, rb.ey, ndest, /*linked=*/false);
-    noc.async_writes_flushed();
+    // the NIU has READ the flag cell, not just sent the request (a plain flush): resetting it below
+    // could otherwise multicast INVALID and strand every receiver -- the rare soak hang (Stage 16,
+    // 2026-10-21); as kernel_lib mcast_pipe.inl's rotating Flag sender
+    noc.async_writes_flushed<NocOptions::TXN_ID>({.trid = 0});
     hf.set(INVALID);
 }
 
@@ -183,7 +186,11 @@ using BRD = moe_fused_swiglu::WeightRuns<WD_SHARD_W>;
 using BR = moe_fused_swiglu::WeightRuns<>;
 // The W_up stream takes its tensor's DRAM ND shard width (0 = interleaved, byte-identical to the
 // pre-WSHARD path). The OUTPUT write-back keeps `BR`: the output is always DRAM interleaved.
+#ifdef MOE_GU_INTERLEAVED
+using BRG = moe_fused_swiglu::InterleavedRuns<1>;  // W_up = the odd tile columns of the gate|up tensor
+#else
 using BRG = moe_fused_swiglu::WeightRuns<WG_SHARD_W>;
+#endif
 
 // PER-STAGE ZONES — PERMANENT, always compiled, free with the profiler off. 5 records per
 // M-block: out_drain, wup, wd_issue, scatter, hslice, out_issue. Names are stable across rounds so

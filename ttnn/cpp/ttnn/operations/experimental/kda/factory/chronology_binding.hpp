@@ -10,6 +10,14 @@
 namespace ttnn::experimental::prim::kda_factory_detail {
 // Rank belongs to mesh placement, not to caller-owned tensor data. The mesh
 // adapter retains each coordinate's scalar specialization on program-cache hits.
+// sequence_parallel_axis == KDA_NO_SEQUENCE_PARALLEL: the sequence is NOT split over the mesh (every chip holds the
+// whole chunk, e.g. tensor-parallel heads on a 2-D mesh): every device is rank 0 of 1, whatever its mesh coordinate.
+inline constexpr uint32_t KDA_NO_SEQUENCE_PARALLEL = 0xFFFFu;
+
+inline bool kda_sequence_axis_ok(uint32_t sequence_parallel_axis, size_t mesh_dims) {
+    return sequence_parallel_axis == KDA_NO_SEQUENCE_PARALLEL || sequence_parallel_axis < mesh_dims;
+}
+
 inline ttnn::device_operation::MeshWorkloadArtifacts chronology_workload(
     const ttnn::device_operation::ProgramArtifacts& artifacts,
     const ttnn::MeshCoordinateRangeSet& tensor_coords,
@@ -18,7 +26,9 @@ inline ttnn::device_operation::MeshWorkloadArtifacts chronology_workload(
     uint32_t local_rows,
     const tt::tt_metal::experimental::KernelSpecName& chronology_reader) {
     using namespace tt::tt_metal::experimental;
-    TT_FATAL(sequence_parallel_axis < device.shape().dims(), "KDA: invalid sequence_parallel_axis");
+    TT_FATAL(
+        kda_sequence_axis_ok(sequence_parallel_axis, device.shape().dims()), "KDA: invalid sequence_parallel_axis");
+    const bool split = sequence_parallel_axis != KDA_NO_SEQUENCE_PARALLEL;
     ttnn::device_operation::MeshWorkloadArtifacts workload;
     for (const auto& coordinate : tensor_coords.coords()) {
         auto spec = artifacts.spec;
@@ -26,8 +36,8 @@ inline ttnn::device_operation::MeshWorkloadArtifacts chronology_workload(
             return kernel.unique_id == chronology_reader;
         });
         TT_FATAL(reader != spec.kernels.end(), "KDA: chronology reader is absent from the program");
-        reader->compile_time_args.insert({"sp_rank", coordinate[sequence_parallel_axis]});
-        reader->compile_time_args.insert({"sp_size", device.shape()[sequence_parallel_axis]});
+        reader->compile_time_args.insert({"sp_rank", split ? coordinate[sequence_parallel_axis] : 0u});
+        reader->compile_time_args.insert({"sp_size", split ? device.shape()[sequence_parallel_axis] : 1u});
         reader->compile_time_args.insert({"local_rows", local_rows});
         workload.programs.push_back({
             .range = ttnn::MeshCoordinateRange(coordinate),

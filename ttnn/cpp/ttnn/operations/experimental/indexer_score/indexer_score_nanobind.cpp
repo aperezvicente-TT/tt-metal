@@ -15,14 +15,18 @@ namespace ttnn::operations::experimental::indexer_score::detail {
 void bind_indexer_score(nb::module_& mod) {
     nb::class_<IndexerScoreProgramConfig>(mod, "IndexerScoreProgramConfig")
         .def(
-            nb::init<std::size_t, std::size_t, std::size_t>(),
+            nb::init<std::size_t, std::size_t, std::size_t, bool, std::size_t>(),
             nb::kw_only(),
             nb::arg("q_chunk_size") = 32,
             nb::arg("k_chunk_size") = 32,
-            nb::arg("head_group_size") = 1)
+            nb::arg("head_group_size") = 1,
+            nb::arg("serial_head_reduce") = false,
+            nb::arg("serial_pass_heads") = 1)
         .def_rw("q_chunk_size", &IndexerScoreProgramConfig::q_chunk_size)
         .def_rw("k_chunk_size", &IndexerScoreProgramConfig::k_chunk_size)
-        .def_rw("head_group_size", &IndexerScoreProgramConfig::head_group_size);
+        .def_rw("head_group_size", &IndexerScoreProgramConfig::head_group_size)
+        .def_rw("serial_head_reduce", &IndexerScoreProgramConfig::serial_head_reduce)
+        .def_rw("serial_pass_heads", &IndexerScoreProgramConfig::serial_pass_heads);
 
     ttnn::bind_function<"indexer_score_dsa", "ttnn.experimental.">(
         mod,
@@ -119,7 +123,12 @@ void bind_indexer_score(nb::module_& mod) {
         nb::arg("seq_shard_axes") = std::nullopt,
         nb::arg("block_cyclic_sp_axis") = std::nullopt,
         nb::arg("block_cyclic_chunk_local") = std::nullopt,
-        nb::arg("block_cyclic_cache_tp_sharded") = false);
+        nb::arg("block_cyclic_cache_tp_sharded") = false,
+        // Trace-safe chunk start on the classic path: a 1-element uint32 DRAM tensor read on-device per dispatch;
+        // the reader derives this device's causal end from it (kv_len = ceil((start + (rank + 1) Sq) / (32 ratio))
+        // compressed tiles) so a replayed program scores only the keys its queries can see. Mutually exclusive with
+        // chunk_start_idx / kv_len; contiguous K only. Output columns past the bound are NOT written (stale).
+        nb::arg("chunk_start_idx_tensor") = nb::none());
 
     ttnn::bind_function<"indexer_score_msa", "ttnn.experimental.">(
         mod,

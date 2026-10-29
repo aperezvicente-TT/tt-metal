@@ -28,6 +28,13 @@ struct SparseSDPAParams {
     std::optional<BlockCyclicLayout> block_cyclic = std::nullopt;
     bool has_block_cyclic() const { return block_cyclic.has_value(); }
     bool has_scaled_kv() const { return kv_format == transformer::SparseKVFormat::SCALED_FP8; }
+    // Split-K attention across devices (the sequence-sharded DSA prefill): also emit the per-(token, head) running
+    // max m (the UNSCALED score max the kernel subtracts) and the finalised row-sum l = sum exp((s - m) scale) of the
+    // keys this call attended, as a second output [1, 1, S, 2 H] fp32 ROW_MAJOR (row = [m_0 .. m_H-1, l_0 .. l_H-1]).
+    // The owner of a head merges the partials of C devices with M = max_c m_c, w_c = exp((m_c - M) scale) l_c /
+    // sum_c' exp((m_c' - M) scale) l_c', o = sum_c w_c o_c. Compile-time (in the program hash); the kernels are
+    // unchanged when off.
+    bool emit_stats = false;
 };
 
 struct SparseSDPAInputs {

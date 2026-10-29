@@ -301,6 +301,17 @@ class TTSampling(LightweightModule):
         # Round up to the next tile boundary (32) — device tensors must be tile-aligned.
         raw_batch = getattr(args, "max_batch_size", 32)
         self.max_batch_size = max(32, ((raw_batch + 31) // 32) * 32)
+        # Forced-argmax fast path: the logits carry max_batch_size (tile-padded) rows but only raw_batch of
+        # them are users. Reducing 32 rows of a 128k vocab cost ~400 us per token on P150 at batch 1; slicing
+        # the valid rows after the untilize cuts that to the row count. Padded rows are refilled with 0.
+        self._argmax_valid_rows = (
+            raw_batch
+            if 0 < raw_batch < self.max_batch_size
+            and getattr(args, "sampling_dp", 1) == 1
+            and (mesh_device.get_num_devices() == 1 or getattr(tt_ccl, "pcie", None) is not None)
+            else None
+        )
+        self._argmax_pad_tokens = None
         self.max_top_k = getattr(args, "max_top_k", 32)
         self.cluster_shape = args.cluster_shape
 
@@ -801,6 +812,15 @@ class TTSampling(LightweightModule):
         - If `tt_ccl` exposes `line_all_gather`, prefer it (enables persistent buffer usage on some stacks).
         - Otherwise fall back to `ttnn.all_gather`.
         """
+        pcie = getattr(self.tt_ccl, "pcie", None)
+        if pcie is not None:
+            # 2-chip PCIe P2P mesh (no fabric): gather over the P2P windows, then move to the requested layout.
+            gathered = pcie.all_gather(tensor, dim)
+            if memory_config is not None and gathered.memory_config() != memory_config:
+                out = ttnn.to_memory_config(gathered, memory_config)
+                ttnn.deallocate(gathered)
+                return out
+            return gathered
         if callable(self._line_all_gather):
             # Some implementations accept `buffer_key` (for persistent buffers), others may not.
             line_all_gather_kwargs = {
@@ -1094,6 +1114,15 @@ class TTSampling(LightweightModule):
                 x = self._mask_invalid_vocab_logits(x)
             # Gather the output across all devices and untilize the tensor (for argmax)
             num_devices = self.mesh_device.get_num_devices()
+            pcie = getattr(self.tt_ccl, "pcie", None)
+            if num_devices > 1 and pcie is not None:
+                # Decode only (tt_out_tok given): prefill logits carry the last-token rows of every position in the
+                # final chunk and the host picks last_token_idx from them, so all rows must stay.
+                tt_out_tok = pcie.argmax_exchange(
+                    x, tt_out_tok, valid_rows=self._argmax_valid_rows if tt_out_tok is not None else None
+                )
+                self.tt_log_probs = None
+                return tt_out_tok, self.tt_log_probs
             if num_devices > 1:
                 cluster_axis = self._get_sampling_cluster_axis()
                 num_links, topology = self._get_force_argmax_all_gather_config(cluster_axis)
@@ -1144,6 +1173,43 @@ class TTSampling(LightweightModule):
             if slice_valid_vocab:
                 x = self._slice_valid_vocab_for_argmax(x)
             x_untilized = self._untilize_for_argmax(x)
+            # Decode only (tt_out_tok is the decode token feedback buffer): prefill logits carry the last-token
+            # rows of every position in the final chunk and the host picks last_token_idx from them.
+            if (
+                tt_out_tok is not None
+                and self._argmax_valid_rows is not None
+                and x_untilized.shape[-2] > self._argmax_valid_rows
+            ):
+                rows = ttnn.slice(
+                    x_untilized,
+                    [0, 0, 0, 0],
+                    [x_untilized.shape[0], x_untilized.shape[1], self._argmax_valid_rows, x_untilized.shape[-1]],
+                    memory_config=x_untilized.memory_config(),
+                )
+                valid_tok = ttnn.argmax(rows, dim=-1, keepdim=False, sub_core_grids=self._force_argmax_sub_core_grids)
+                ttnn.deallocate(rows)
+                if self._argmax_pad_tokens is None:
+                    self._argmax_pad_tokens = ttnn.from_torch(
+                        torch.zeros(
+                            list(valid_tok.shape)[:-1] + [x_untilized.shape[-2] - self._argmax_valid_rows],
+                            dtype=torch.int32,
+                        ),
+                        dtype=valid_tok.dtype,
+                        layout=ttnn.ROW_MAJOR_LAYOUT,
+                        device=self.mesh_device,
+                        memory_config=valid_tok.memory_config(),
+                    )
+                full_tok = ttnn.concat(
+                    [valid_tok, self._argmax_pad_tokens], dim=-1, memory_config=valid_tok.memory_config()
+                )
+                ttnn.deallocate(valid_tok)
+                if tt_out_tok is not None:
+                    ttnn.copy(ttnn.reshape(full_tok, tt_out_tok.shape), tt_out_tok)
+                    ttnn.deallocate(full_tok)
+                else:
+                    tt_out_tok = full_tok
+                self.tt_log_probs = None
+                return tt_out_tok, self.tt_log_probs
             tt_out_tok = ttnn.argmax(
                 x_untilized,
                 dim=-1,

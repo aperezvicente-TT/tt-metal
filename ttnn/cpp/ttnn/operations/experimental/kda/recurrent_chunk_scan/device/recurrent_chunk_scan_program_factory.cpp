@@ -161,9 +161,11 @@ ttnn::device_operation::MeshWorkloadArtifacts RecurrentChunkScanProgramFactory::
         make_dfb(final_state_dfb_name, kv, fp32),
         make_dfb(transport_state_dfb_name, summary ? kv : 1, tt::DataFormat::Float16_b),
         make_dfb(scratch_dfb_name, scratch_entries, fp32),
-        make_dfb(summary_raw_dfb_name, kv, fp32),
-        make_dfb(summary_seed_dfb_name, kv, fp32),
-        make_dfb(summary_ring_dfb_name, 2 * kv, fp32),
+        // summary-only payloads (compute_summary / the reader's identity seed): one tile in the recurrent scan, which
+        // otherwise carried 4 Kt Vt idle fp32 tiles per core above co-resident L1 buffers
+        make_dfb(summary_raw_dfb_name, summary ? kv : 1, fp32),
+        make_dfb(summary_seed_dfb_name, summary ? kv : 1, fp32),
+        make_dfb(summary_ring_dfb_name, summary ? 2 * kv : 1, fp32),
         // ProgramSpec names must exist even when if-constexpr discards their
         // users. Give inactive-mode buffers one tile instead of reserving every
         // summary and recurrent restart payload simultaneously.

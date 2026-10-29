@@ -20,12 +20,13 @@ namespace ttnn::prim {
 struct SparseSDPAOperation {
     using operation_attributes_t = SparseSDPAParams;
     using tensor_args_t = SparseSDPAInputs;
-    using spec_return_value_t = tt::tt_metal::TensorSpec;
-    using tensor_return_value_t = Tensor;
+    // [out] or, with emit_stats, [out, stats] (split-K partial statistics; see SparseSDPAParams::emit_stats)
+    using spec_return_value_t = std::vector<tt::tt_metal::TensorSpec>;
+    using tensor_return_value_t = std::vector<Tensor>;
 
     struct SparseSDPAProgramFactory {
         static tt::tt_metal::ProgramDescriptor create_descriptor(
-            const operation_attributes_t& attrs, const tensor_args_t& t, tensor_return_value_t& output);
+            const operation_attributes_t& attrs, const tensor_args_t& t, tensor_return_value_t& outputs);
 
         // Cache-hit re-apply of the per-dispatch state the hash excludes: buffer addresses and
         // kv_batch_page_offset (cache_batch_idx * kv length T). Patched in place; no rebuild.
@@ -49,7 +50,7 @@ struct SparseSDPAOperation {
     static ttsl::hash::hash_t compute_program_hash(const operation_attributes_t&, const tensor_args_t&);
 };
 
-Tensor sparse_sdpa(
+std::vector<Tensor> sparse_sdpa(
     const Tensor& q,
     const Tensor& kv,
     const Tensor& indices,
@@ -60,6 +61,7 @@ Tensor sparse_sdpa(
     ttnn::DeviceComputeKernelConfig compute_kernel_config,
     std::optional<uint32_t> cache_batch_idx = std::nullopt,
     std::optional<BlockCyclicLayout> block_cyclic = std::nullopt,
-    const std::optional<Tensor>& attention_sink = std::nullopt);
+    const std::optional<Tensor>& attention_sink = std::nullopt,
+    bool emit_stats = false);
 
 }  // namespace ttnn::prim
