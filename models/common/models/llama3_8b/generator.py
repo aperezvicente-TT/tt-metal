@@ -82,6 +82,10 @@ class Llama3Generator:
         "supports_sample_on_device": True,
         "max_device_top_k": 32,
         "accepts_trace_mode": True,
+        # Prefill and decode are trace replays on command queues; no Blackhole service core or DRAM
+        # core is used by this model (no sub-devices, no DRAM-core prefetcher).
+        "kv_readiness": {"prefill": "queue", "decode": "queue"},
+        "kv_free_resources": ("service_cores", "dram_cores"),
     }
     requires_prefill_trace_warmup = True
 

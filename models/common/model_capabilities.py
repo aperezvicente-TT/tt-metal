@@ -72,6 +72,14 @@ class ModelCapabilitiesMixin:
     ``accepts_trace_mode`` (bool)
         The generator honours a ``trace_mode`` argument. Used by the common
         LLM runtime, not by the vLLM TT plugin.
+    ``kv_readiness`` (dict ``{"prefill": mode, "decode": mode}``, mode ``"queue"`` or ``"device"``)
+        How KV connectors may order copies against the model. ``"queue"``: the phase runs as
+        trace replays (or other work) on command queues and returns to the host between steps, so
+        a copy can be ordered with an event recorded between replays. ``"device"``: the phase runs
+        as a program that does not return between steps and publishes KV-ready counters instead.
+    ``kv_free_resources`` (tuple of ``"service_cores"``, ``"dram_cores"``)
+        Device resources the model leaves unused, which a KV connector's data mover may claim.
+        Absent: nothing is promised free.
     """
 
     @classmethod
