@@ -59,7 +59,7 @@ def _canonical_shared_kv_shapes(per_layer_specs) -> dict:
     return canonical
 
 
-def allocate_vllm_kv_cache_per_layer(per_layer_specs, dp_model: List[Transformer], tt_cache_path):
+def allocate_vllm_kv_cache_per_layer(per_layer_specs, dp_model: List[Transformer], tt_cache_path, kv_cache_dtype=None):
     """Allocate KV cache tensors with optional cross-layer DRAM sharing.
 
     Args:
@@ -74,6 +74,8 @@ def allocate_vllm_kv_cache_per_layer(per_layer_specs, dp_model: List[Transformer
         dp_model: list of replicated TT model handles, one per data-parallel
             submesh.
         tt_cache_path: path used for on-disk weight cache file naming.
+        kv_cache_dtype: ttnn dtype requested by the serving engine (vLLM
+            ``--kv-cache-dtype``); overrides the model's precision profile.
 
     Returns:
         ``list[submesh][layer_idx][k_or_v]`` of TT tensors. Multiple
@@ -98,15 +100,17 @@ def allocate_vllm_kv_cache_per_layer(per_layer_specs, dp_model: List[Transformer
             kv_cache_shape = canonical_shape[tensor_idx]
             cache_kv = torch.zeros(kv_cache_shape, dtype=dtype)
             # Get the dtype for the kv cache based on the configured optimizations in the model
-            if dp_model[mesh_idx].args.optimizations is not None:
-                kv_cache_dtype = dp_model[mesh_idx].args.optimizations.get_tensor_dtype(
+            if kv_cache_dtype is not None:
+                layer_kv_dtype = kv_cache_dtype
+            elif dp_model[mesh_idx].args.optimizations is not None:
+                layer_kv_dtype = dp_model[mesh_idx].args.optimizations.get_tensor_dtype(
                     decoder_id=layer_num, tensor=TensorGroup.KV_CACHE
                 )
             else:
                 logger.info("No dtype specified for the model KV cache - defaulting to ttnn.bfloat8_b.")
-                kv_cache_dtype = None
+                layer_kv_dtype = None
             # Set default to bfloat8_b when no optimizations are configured
-            kv_cache_dtype = ttnn.bfloat8_b if kv_cache_dtype is None else kv_cache_dtype
+            layer_kv_dtype = ttnn.bfloat8_b if layer_kv_dtype is None else layer_kv_dtype
             kv_tt_i = [
                 ttnn.as_tensor(
                     cache_kv,
@@ -116,7 +120,7 @@ def allocate_vllm_kv_cache_per_layer(per_layer_specs, dp_model: List[Transformer
                     mesh_mapper=ttnn.ReplicateTensorToMesh(submesh),
                     layout=ttnn.TILE_LAYOUT,
                     memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                    dtype=kv_cache_dtype,
+                    dtype=layer_kv_dtype,
                     # Separate cache files for K and V to avoid collision.
                     # ``tensor_idx`` distinguishes shared buffers that have the
                     # same shape but back different layer subsets. A ``None``
@@ -139,7 +143,9 @@ def allocate_vllm_kv_cache_per_layer(per_layer_specs, dp_model: List[Transformer
     return kv_cache
 
 
-def allocate_vllm_kv_cache(kv_cache_shape, dtype, num_layers, dp_model: List[Transformer], tt_cache_path):
+def allocate_vllm_kv_cache(
+    kv_cache_shape, dtype, num_layers, dp_model: List[Transformer], tt_cache_path, kv_cache_dtype=None
+):
     """Uniform-shape KV cache allocator for non-hybrid models.
 
     Hybrid attention models should use :func:`allocate_vllm_kv_cache_per_layer`,
@@ -150,6 +156,7 @@ def allocate_vllm_kv_cache(kv_cache_shape, dtype, num_layers, dp_model: List[Tra
         [(kv_cache_shape, dtype, i) for i in range(num_layers)],
         dp_model=dp_model,
         tt_cache_path=tt_cache_path,
+        kv_cache_dtype=kv_cache_dtype,
     )
 
 
@@ -680,6 +687,7 @@ class MllamaForConditionalGeneration(Generator, SupportsMultiModal):
 
 class LlamaForCausalLM(Generator):
     decode_input_update_contract = 1
+    supports_host_candidates = True
 
     # Class-level capabilities
     model_capabilities = {
