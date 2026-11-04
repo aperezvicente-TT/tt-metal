@@ -30,6 +30,7 @@ from models.common.sampling import (
     format_sampling_params,
     scatter_sampling_params_to_slots,
 )
+from models.common.sampling.host_candidates import HOST_CANDIDATE_K, DecodeCandidates, host_candidates_supported
 from models.common.sampling.tt_log_probs import LogProbsResult, reformat_logprobs
 from models.common.warmup import WarmupForwardMixin
 from models.tt_transformers.tt.common import (
@@ -48,6 +49,10 @@ MAX_BATCHED_PREFILL_SEQ_LEN = 128 * 1024
 
 # Power-of-2 batch sizes supported by trace caching for batched prefill.
 SUPPORTED_PREFILL_BATCH_SIZES = (1, 2, 4, 8, 16, 32)
+
+
+# Decode trace key of the host-candidate variant, next to the on-device-sampling bools.
+HOST_CANDIDATES_TRACE_KEY = "host_candidates"
 
 
 @dataclass(frozen=True)
@@ -275,6 +280,20 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         self._pending_deferred_decode_sampling: DeferredDecodeSampling | None = None
         self._deferred_decode_sampling_failed = False
         self.device_grammar_enabled = False
+        # Candidates of the latest host-candidate decode, kept for read_decode_candidate_logits.
+        self._last_decode_candidates = None
+        self.host_candidate_k = None
+        if (
+            self.supports_host_candidates
+            and self.data_parallel == 1
+            and all(hasattr(m, "prepare_host_candidates") for m in self.model)
+            and host_candidates_supported(self.model_args[0].mesh_device, HOST_CANDIDATE_K)
+        ):
+            self.host_candidate_k = HOST_CANDIDATE_K
+            self.model_capabilities = {
+                **type(self).model_capabilities,
+                "host_candidate_sampling": {"k": HOST_CANDIDATE_K},
+            }
 
         if self.model_capabilities.get("supports_device_grammar", False):
             samplers = [getattr(model, "sampling", None) for model in self.model]
@@ -291,6 +310,9 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
     model_capabilities = {
         "supports_prefix_caching": False,
     }
+    # Subclasses whose model implements ttnn_decode_forward(host_candidates=True) opt in; the
+    # capability is advertised only where the device supports it (see __init__).
+    supports_host_candidates = False
 
     def enable_device_grammar(self) -> bool:
         """Allocate grammar state only after the serving runtime selects it."""
@@ -2192,8 +2214,18 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         grammar_bitmask: torch.Tensor | None = None,
         skip_trace_precompile: bool = False,
         prepare_trace: bool = False,
+        host_candidates: bool = False,
+        candidate_temperature: torch.Tensor | None = None,
         **kwargs,
     ):
+        """Run one decode step for every row.
+
+        ``host_candidates=True`` (host sampling only; requires ``host_candidate_k``) returns, instead
+        of logits, each row's top-``host_candidate_k`` raw logits and vocabulary ids and the
+        logsumexp over the vocabulary of logits / ``candidate_temperature`` (rows with T <= 0 use
+        T = 1). After host processing that is ``(values [B, K] float32, indices [B, K] int64,
+        lse [B] float32)``. ``read_decode_candidate_logits`` reads the full logits of that step.
+        """
         if self._deferred_decode_sampling_failed:
             raise RuntimeError(
                 "a prior deferred device-sampling step failed after decode "
@@ -2212,6 +2244,8 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
             self.model[i].switch_mode(Mode.DECODE)
 
         on_device_sampling = (sampling_params is not None) or defer_device_sampling
+        if host_candidates and (on_device_sampling or not self.host_candidate_k):
+            raise ValueError("host_candidates requires host sampling and a model advertising host_candidate_sampling")
         if not enable_trace and not reload_inputs:
             raise ValueError("Non-traced decode rebuilds all forward inputs and requires reload_inputs=True")
 
@@ -2230,6 +2264,18 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
             "kv_cache": kv_cache,
             "on_device_sampling": on_device_sampling,
         }
+        self._last_decode_candidates = None
+        if host_candidates:
+            # Only passed when set, so subclasses overriding the trace helpers keep their call shape.
+            decode_kwargs["host_candidates"] = True
+            temperature = (
+                torch.ones(tokens[0].shape[0] * self.data_parallel)
+                if candidate_temperature is None
+                else torch.as_tensor(candidate_temperature, dtype=torch.float32).reshape(-1)
+            )
+            for i, temperature_i in enumerate(torch.chunk(temperature, self.data_parallel, 0)):
+                self.model[i].prepare_host_candidates()
+                self.model[i].set_candidate_temperature(temperature_i)
 
         if enable_trace:
             tt_decode_output = self._decode_forward_trace_text(
@@ -2277,6 +2323,8 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                 reload_inputs=reload_inputs,
                 grammar_bitmask=grammar_bitmask,
             )
+        if host_candidates:
+            self._last_decode_candidates = tt_decode_output
         # Host sampling
         if read_from_device:
             to_host = self.read_decode_output(tt_decode_output)
@@ -2299,6 +2347,7 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         page_table=None,
         kv_cache=None,
         on_device_sampling=False,
+        host_candidates=False,
     ):
         """
         Performs text decode step.
@@ -2337,7 +2386,11 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                 page_table=tt_page_table[i],
                 kv_cache=user_kv_cache,
                 on_device_logits=on_device_sampling,
+                **({"host_candidates": True} if host_candidates else {}),
             )
+            if host_candidates:
+                tt_output.append(decode_out)
+                continue
             if isinstance(decode_out, tuple):
                 tt_logits_i, tt_log_probs_i = decode_out
             else:
@@ -2358,15 +2411,23 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
     def _decode_trace_key(self, on_device_sampling, tokens):
         return on_device_sampling
 
+    def _decode_variant_key(self, on_device_sampling, tokens, host_candidates=False):
+        return HOST_CANDIDATES_TRACE_KEY if host_candidates else self._decode_trace_key(on_device_sampling, tokens)
+
     def _prepare_decode_trace_variant(
-        self, tokens, current_pos, page_table=None, kv_cache=None, on_device_sampling=False
+        self, tokens, current_pos, page_table=None, kv_cache=None, on_device_sampling=False, **variant
     ):
         """Stage a decode variant during an eager warmup call, inside the model's input routing."""
         if self._uses_prefetcher():
             return self._decode_forward_no_trace_text(
-                tokens, current_pos, page_table=page_table, kv_cache=kv_cache, on_device_sampling=on_device_sampling
+                tokens,
+                current_pos,
+                page_table=page_table,
+                kv_cache=kv_cache,
+                on_device_sampling=on_device_sampling,
+                **variant,
             )
-        key = self._decode_trace_key(on_device_sampling, tokens)
+        key = self._decode_variant_key(on_device_sampling, tokens, **variant)
         if not hasattr(self, "_prepared_decode_traces"):
             self._prepared_decode_traces = {}
         if key not in self._prepared_decode_traces and not self.trace_ids_decode[key]:
@@ -2377,11 +2438,17 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                 kv_cache=kv_cache,
                 on_device_sampling=on_device_sampling,
                 return_compile_output=True,
+                **variant,
             )
             self._prepared_decode_traces[key] = prepared
             return prepared.pop("compile_output")
         return self._decode_forward_no_trace_text(
-            tokens, current_pos, page_table=page_table, kv_cache=kv_cache, on_device_sampling=on_device_sampling
+            tokens,
+            current_pos,
+            page_table=page_table,
+            kv_cache=kv_cache,
+            on_device_sampling=on_device_sampling,
+            **variant,
         )
 
     def _prepare_decode_trace_text(
@@ -2393,6 +2460,7 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         on_device_sampling=False,
         skip_precompile=False,
         return_compile_output=False,
+        host_candidates=False,
     ):
         """Phase 1 of decode trace setup: run the compile pass and stage the persistent trace inputs.
 
@@ -2403,6 +2471,10 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         """
         # Compile run. Skipped when the caller already has a warmed program cache for this variant
         # (decode bucketing threads skip_precompile through from main).
+        variant = {"host_candidates": True} if host_candidates else {}
+        if host_candidates:
+            for model in self.model:
+                model.prepare_host_candidates()
         compile_output = None
         if not skip_precompile:
             compile_output = self._decode_forward_no_trace_text(
@@ -2411,6 +2483,7 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                 page_table=page_table,
                 kv_cache=kv_cache,
                 on_device_sampling=on_device_sampling,
+                **variant,
             )
             logger.info("Done Compiling Model")
 
@@ -2454,6 +2527,7 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
             "device_inputs": device_inputs,
             "kv_cache": kv_cache,
             "on_device_sampling": on_device_sampling,
+            **variant,
         }
         if return_compile_output:
             prepared["compile_output"] = compile_output
@@ -2469,6 +2543,7 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         prepared.pop("compile_output", None)
         kv_cache = prepared["kv_cache"]
         on_device_sampling = prepared["on_device_sampling"]
+        variant = {"host_candidates": True} if prepared.get("host_candidates") else {}
 
         tt_out_trace = []
         trace_ids = {}
@@ -2501,6 +2576,7 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                         *model_inputs,
                         kv_cache=user_kv_cache,
                         on_device_logits=on_device_sampling,
+                        **variant,
                     )
                 )
                 ttnn.end_trace_capture(self.model_args[i].mesh_device, trace_id, cq_id=0)
@@ -2538,6 +2614,8 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
             variant = param is not None
             if variant not in variants:
                 variants.append(variant)
+        if self.host_candidate_k:
+            variants.append(HOST_CANDIDATES_TRACE_KEY)
         if not variants or page_table is None or self._uses_prefetcher():
             return False
         if self.mode != Mode.DECODE:
@@ -2547,18 +2625,21 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         tokens = torch.chunk(tokens, self.data_parallel, 0)
         start_pos = torch.chunk(start_pos, self.data_parallel, 0)
         page_table = torch.chunk(page_table, self.data_parallel, 0)
-        variants = [(v, self._decode_trace_key(v, tokens)) for v in variants]
-        variants = [(v, key) for v, key in variants if not self.trace_ids_decode[key]]
+        variants = [
+            ((False, {"host_candidates": True}) if v == HOST_CANDIDATES_TRACE_KEY else (v, {})) for v in variants
+        ]
+        variants = [(v, kw, self._decode_variant_key(v, tokens, **kw)) for v, kw in variants]
+        variants = [(v, kw, key) for v, kw, key in variants if not self.trace_ids_decode[key]]
         if not variants:
             return False
         staged = getattr(self, "_prepared_decode_traces", {})
         prepared = []
-        for variant, key in variants:
+        for variant, kw, key in variants:
             if key in staged:
                 prep = staged.pop(key)
             else:
                 prep = self._prepare_decode_trace_text(
-                    tokens, start_pos, page_table=page_table, kv_cache=kv_cache, on_device_sampling=variant
+                    tokens, start_pos, page_table=page_table, kv_cache=kv_cache, on_device_sampling=variant, **kw
                 )
             prepared.append((key, prep))
         for key, prep in prepared:
@@ -2576,6 +2657,7 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         kv_cache=None,
         on_device_sampling=False,
         skip_precompile=False,
+        **variant,
     ):
         """Prepare and immediately capture the decode trace.
 
@@ -2586,7 +2668,7 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         ``skip_precompile`` is forwarded to the prepare phase, where main's decode-bucketing callers use
         it to state that the program cache is already warm for this variant.
         """
-        key = self._decode_trace_key(on_device_sampling, tokens)
+        key = self._decode_variant_key(on_device_sampling, tokens, **variant)
         staged = getattr(self, "_prepared_decode_traces", {})
         prepared = (
             staged.pop(key)
@@ -2598,6 +2680,7 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                 kv_cache=kv_cache,
                 on_device_sampling=on_device_sampling,
                 skip_precompile=skip_precompile,
+                **variant,
             )
         )
         return self._record_decode_trace_text(prepared)
@@ -2613,6 +2696,7 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         reload_inputs: bool,
         reload_page_table: bool,
         skip_precompile: bool = False,
+        host_candidates: bool = False,
     ):
         """
         Run decode forward text with tracing
@@ -2623,7 +2707,9 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         device-produced token and position state.
         """
         # The trace is different depending on whether we are doing device sampling or not
-        if not self.trace_ids_decode[on_device_sampling]:
+        variant = {"host_candidates": True} if host_candidates else {}
+        key = HOST_CANDIDATES_TRACE_KEY if host_candidates else on_device_sampling
+        if not self.trace_ids_decode[key]:
             trace_ids, tt_out_trace, *device_inputs = self._capture_decode_trace_text(
                 tokens,
                 current_pos,
@@ -2631,10 +2717,11 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                 kv_cache=kv_cache,
                 on_device_sampling=on_device_sampling,
                 skip_precompile=skip_precompile,
+                **variant,
             )
-            self.trace_ids_decode[on_device_sampling] = trace_ids
-            self.trace_inputs_decode[on_device_sampling] = device_inputs
-            self.trace_output_decode[on_device_sampling] = tt_out_trace
+            self.trace_ids_decode[key] = trace_ids
+            self.trace_inputs_decode[key] = device_inputs
+            self.trace_output_decode[key] = tt_out_trace
 
         for i in range(self.data_parallel):
             user_page_table = page_table[i] if page_table is not None else None
@@ -2646,7 +2733,7 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                 host_inputs_i = self.model[i].prepare_decode_inputs_host(tokens[i], current_pos[i], user_page_table)
                 copy_host_to_device(
                     host_tensors=host_inputs_i,
-                    device_tensors=self.trace_inputs_decode[on_device_sampling][i],
+                    device_tensors=self.trace_inputs_decode[key][i],
                 )
             elif reload_page_table:
                 # With async device sampling, token/position inputs may
@@ -2656,13 +2743,13 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                 # preserve device-produced tokens.
                 host_inputs_i = self.model[i].prepare_decode_inputs_host(tokens[i], current_pos[i], user_page_table)
                 host_page_table = host_inputs_i[DECODE_PAGE_TABLE_INPUT_IDX]
-                device_page_table = self.trace_inputs_decode[on_device_sampling][i][DECODE_PAGE_TABLE_INPUT_IDX]
+                device_page_table = self.trace_inputs_decode[key][i][DECODE_PAGE_TABLE_INPUT_IDX]
                 if host_page_table is not None:
                     ttnn.copy_host_to_device_tensor(host_page_table, device_page_table)
 
-        for i, trace_id in self.trace_ids_decode[on_device_sampling].items():
+        for i, trace_id in self.trace_ids_decode[key].items():
             ttnn.execute_trace(self.model_args[i].mesh_device, trace_id, cq_id=0, blocking=False)
-        return self.trace_output_decode[on_device_sampling]
+        return self.trace_output_decode[key]
 
     def _apply_sampling_slot_remap(self, slot_remap) -> None:
         if slot_remap is None:
@@ -3386,6 +3473,23 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
                 return None
             return lp.cpu(blocking=blocking)
 
+        if isinstance(tt_out[0], DecodeCandidates):
+            if sample_rows is not None:
+                raise ValueError("Selective host rows are not supported for host candidates")
+            # The full logits stay on device for read_decode_candidate_logits.
+            host_outputs = [
+                DecodeCandidates(
+                    out.values.cpu(blocking=not async_read),
+                    out.indices.cpu(blocking=not async_read),
+                    out.lse.cpu(blocking=not async_read),
+                    None,
+                )
+                for out in tt_out
+            ]
+            if not async_read:
+                return host_outputs
+            return host_outputs, [ttnn.record_event(self.model[i].mesh_device, 0) for i in range(len(tt_out))]
+
         if sample_rows is not None:
             batch_per_model = self.model_args[0].max_batch_size
             capacity = batch_per_model * self.data_parallel
@@ -3435,6 +3539,19 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
 
         return host_outputs, read_events
 
+    def read_decode_candidate_logits(self):
+        """Full logits [B, vocab] float32 of the latest ``host_candidates`` decode, for rows its
+        candidates cannot decide. Blocking. Valid until the next decode submission, which may
+        overwrite the traced buffer."""
+        if self._last_decode_candidates is None:
+            raise RuntimeError("no host-candidate decode output is available to read")
+        B = self.model_args[0].max_batch_size
+        rows = []
+        for i, out in enumerate(self._last_decode_candidates):
+            logits = ttnn.to_torch(ttnn.get_device_tensors(out.logits)[0]).float()
+            rows.append(logits.reshape(-1, logits.shape[-1])[:B, : self.model[i].vocab_size])
+        return rows[0] if len(rows) == 1 else torch.cat(rows, 0)
+
     # Note: This function is called by vLLM
     def process_decode_output_host(self, tt_out, is_tokens=False, sample_rows=None):
         """
@@ -3455,6 +3572,14 @@ class Generator(ModelCapabilitiesMixin, WarmupForwardMixin):
         from models.common.sampling.tt_log_probs import LogProbsResult
 
         max_batch_size_per_model = self.model_args[0].max_batch_size
+
+        if isinstance(tt_out[0], DecodeCandidates):
+            if is_tokens or sample_rows is not None:
+                raise ValueError("Host candidates are neither tokens nor compactable logits")
+            parts = [
+                self.model[i].process_candidates_decode(out, max_batch_size_per_model) for i, out in enumerate(tt_out)
+            ]
+            return tuple(torch.cat(t, 0) for t in zip(*parts))
 
         if sample_rows is not None:
             capacity = max_batch_size_per_model * self.data_parallel

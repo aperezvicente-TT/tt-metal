@@ -12,6 +12,13 @@ import ttnn
 from models.common.lightweightmodule import LightweightModule
 from models.common.rmsnorm import RMSNorm
 from models.common.sampling.generator import SamplingGenerator
+from models.common.sampling.host_candidates import (
+    HOST_CANDIDATE_K,
+    candidates_to_torch,
+    decode_candidates,
+    inv_temperature_host,
+    make_vocab_mask,
+)
 from models.common.sampling.tt_sampling import TOPK_MAX_WIDTH, TTSampling
 from models.tt_transformers.tt.ccl import TT_CCL
 from models.tt_transformers.tt.common import Mode, copy_host_to_device
@@ -1035,10 +1042,12 @@ class Transformer(LightweightModule):
         kv_cache=None,
         on_device_logits=False,
         page_tables_per_layer=None,
+        host_candidates=False,
     ):
         """
         This method will take device tensors and any other args to run forward.
-        It returns ttnn device tensors.
+        It returns ttnn device tensors: logits for on-device sampling, ``(untilized logits, None)``
+        for host sampling, or a ``DecodeCandidates`` for host candidate sampling.
         """
         rot_mats_global = self.rope_setup.get_rot_mats(rot_mat_idxs)
         rot_mats_local = self.rope_local_setup.get_rot_mats(rot_mat_idxs) if hasattr(self, "rope_local_setup") else None
@@ -1070,6 +1079,14 @@ class Transformer(LightweightModule):
             self._increment_decode_positions_device(current_pos, rot_mat_idxs)
             return tt_logits
 
+        if host_candidates:
+            return decode_candidates(
+                tt_logits,
+                self._candidate_inv_temp,
+                k=HOST_CANDIDATE_K,
+                vocab_mask=self._candidate_vocab_mask,
+            )
+
         # Gather the output across all devices and untilize the tensor (for argmax)
         if self.args.num_devices > 1:
             cluster_axis = 0 if self.args.is_galaxy else None
@@ -1098,6 +1115,35 @@ class Transformer(LightweightModule):
         )
 
         return tt_logits, None
+
+    def prepare_host_candidates(self):
+        """Allocate the persistent inputs of host-candidate decode: the per-row 1/T column (a trace
+        input, rewritten by ``set_candidate_temperature``) and the padded-vocabulary mask. Must run
+        before the first capture of that decode variant."""
+        if getattr(self, "_candidate_inv_temp", None) is not None:
+            return
+        if self.args.num_devices != 1:
+            raise ValueError("host candidate decode supports a single device")
+        self._candidate_vocab_mask = make_vocab_mask(self.mesh_device, self.vocab_size, self.args.padded_vocab_size)
+        self._candidate_inv_temp_host = None
+        self._candidate_inv_temp = ttnn.to_device(
+            inv_temperature_host(torch.ones(1), self.mesh_device),
+            self.mesh_device,
+            memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        )
+
+    def set_candidate_temperature(self, temperature):
+        """Write per-row temperatures (rows beyond the tensor, or T <= 0, use 1) into the 1/T input."""
+        t = torch.as_tensor(temperature, dtype=torch.float32).reshape(-1)
+        if self._candidate_inv_temp_host is not None and torch.equal(self._candidate_inv_temp_host, t):
+            return
+        ttnn.copy_host_to_device_tensor(inv_temperature_host(t, self.mesh_device), self._candidate_inv_temp)
+        self._candidate_inv_temp_host = t.clone()
+
+    def process_candidates_decode(self, candidates, B):
+        """Host (or device) candidates to torch: values [B, K] raw logits, indices [B, K] int64 and
+        lse [B] of logits / T over the vocabulary."""
+        return candidates_to_torch(candidates, B)
 
     def switch_mode(self, mode: Mode):
         if self.prefetcher is not None:

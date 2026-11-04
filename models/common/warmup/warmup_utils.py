@@ -163,4 +163,15 @@ class WarmupForwardMixin:
                 )
                 self.decode_forward(**grammar_kwargs)
 
+        if getattr(self, "host_candidate_k", None):
+            logger.info("Warming up decode for host candidate sampling")
+            candidate_kwargs = dict(
+                decode_kwargs,
+                sampling_params=None,
+                reload_sampling_params=False,
+                host_candidates=True,
+                candidate_temperature=torch.ones(max_batch_size),
+            )
+            self.decode_forward(**candidate_kwargs)
+
         logger.info("Decode warmup completed")

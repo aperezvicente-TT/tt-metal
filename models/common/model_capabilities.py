@@ -63,6 +63,12 @@ class ModelCapabilitiesMixin:
     ``output_tokens_per_step`` (positive int)
         Tokens committed per engine step. The plugin treats a value greater
         than 1 as a block-output model. Defaults to 1 when absent.
+    ``host_candidate_sampling`` (dict ``{"k": K}``)
+        Instance-level, set only where the device supports it. Host-sampled decode may pass
+        ``host_candidates=True`` and ``candidate_temperature`` to ``decode_forward``; the host output
+        is then ``(values [B, K], indices [B, K], lse [B])``: each row's top-K raw logits sorted
+        descending, their vocabulary ids, and the logsumexp of logits / T over the vocabulary.
+        ``read_decode_candidate_logits()`` returns that step's full logits until the next decode.
     ``accepts_trace_mode`` (bool)
         The generator honours a ``trace_mode`` argument. Used by the common
         LLM runtime, not by the vLLM TT plugin.
