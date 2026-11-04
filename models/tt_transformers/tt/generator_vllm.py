@@ -143,6 +143,26 @@ def allocate_vllm_kv_cache_per_layer(per_layer_specs, dp_model: List[Transformer
     return kv_cache
 
 
+def kv_cache_device_dtypes(dp_model: List[Transformer], kv_cache_dtype=None) -> List[str]:
+    """Per-layer ttnn dtype name of the device KV cache, as allocate_vllm_kv_cache_per_layer chooses it.
+
+    KV connectors that stage blocks in host memory size those buffers before the caches exist, so
+    they need the device dtype (bfloat8_b packs 1088 bytes per tile, not one byte per element).
+    """
+    model = dp_model[0]
+    out = []
+    for layer_num in range(model.args.n_layers):
+        if kv_cache_dtype is not None:
+            dt = kv_cache_dtype
+        elif model.args.optimizations is not None:
+            dt = model.args.optimizations.get_tensor_dtype(decoder_id=layer_num, tensor=TensorGroup.KV_CACHE)
+        else:
+            dt = None
+        dt = ttnn.bfloat8_b if dt is None else dt
+        out.append(str(dt).split(".")[-1].lower())
+    return out
+
+
 def allocate_vllm_kv_cache(
     kv_cache_shape, dtype, num_layers, dp_model: List[Transformer], tt_cache_path, kv_cache_dtype=None
 ):
@@ -777,6 +797,9 @@ class LlamaForCausalLM(Generator):
     def decode_forward(self, *args, **kwargs):
         return super().decode_forward(*args, **kwargs)
 
+    def kv_cache_device_dtypes(self, kv_cache_dtype=None):
+        return kv_cache_device_dtypes(self.model, kv_cache_dtype)
+
     def allocate_kv_cache(self, *args, **kwargs):
         return allocate_vllm_kv_cache(*args, **kwargs, dp_model=self.model, tt_cache_path=self.cache_path)
 
@@ -865,6 +888,9 @@ class QwenForCausalLM(Generator):
 
     def decode_forward(self, *args, **kwargs):
         return super().decode_forward(*args, **kwargs)
+
+    def kv_cache_device_dtypes(self, kv_cache_dtype=None):
+        return kv_cache_device_dtypes(self.model, kv_cache_dtype)
 
     def allocate_kv_cache(self, *args, **kwargs):
         return allocate_vllm_kv_cache(*args, **kwargs, dp_model=self.model, tt_cache_path=self.cache_path)
