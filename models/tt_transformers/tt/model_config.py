@@ -2714,6 +2714,7 @@ class ModelArgs:
                 "N300": [128, 1024, 2048, 4096, 8192],
                 "T3K": [128, 1024, 2048, 4096, 8192],
                 "TG": [128, 1024, 2048, 4096, 8192],
+                "P150": [128, 1024, 2048, 4096],
             },
             "Llama-3.1-70B": {
                 "T3K": [128, 1024, 2048, 4096, 8192],
@@ -3314,7 +3315,9 @@ class ModelArgs:
         """
         This function is used to determine if trace should be enabled for the prefill.
         Tracing is used only for certain sequence lengths, because for bigger sequence lengths, op2op gaps are already small, so we don't need tracing.
-        # TODO: Support chunked prefill with tracing - https://github.com/tenstorrent/tt-metal/issues/32056
+        A resumed prefill (num_cached_tokens > 0: prefix-cache hit or a later chunk of a scheduler-split prompt)
+        replays its own trace per length, so num_cached_tokens does not gate it.
+        # TODO: Chunks of one prefill call longer than max_prefill_chunk_size still run untraced - https://github.com/tenstorrent/tt-metal/issues/32056
         """
 
         allowed_seq_lens = self.trace_prefill_supported_seq_lens
