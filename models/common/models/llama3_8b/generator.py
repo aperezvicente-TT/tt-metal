@@ -35,6 +35,7 @@ class Llama3GeneratorConfig:
     optimizations: Any = "performance"
     trace_mode: TraceMode = "all"
     device_sampling_enabled: bool = False
+    kv_cache_dtype: Any = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.hf_model, str) or not self.hf_model:
@@ -72,6 +73,11 @@ class Llama3Generator:
 
     model_capabilities = {
         "supports_prefix_caching": True,
+        # Scheduler chunks continue from a cached start, the same planned path
+        # as a prefix-cache hit. On P150 only 128/1024-token invocations are
+        # warmed and traced, so prompts longer than 1024 tokens are served only
+        # as chunks of at most 1024 (--max-num-batched-tokens <= 1024).
+        "supports_chunked_prefill": True,
         "supports_async_decode": True,
         "supports_sample_on_device": True,
         "max_device_top_k": 32,
@@ -82,6 +88,7 @@ class Llama3Generator:
     def __init__(self, target: Any, adapter: VLLMAdapter):
         self.target = target
         self._adapter = adapter
+        self._serving_ready_summary_logged = False
 
     # Public vLLM API
 
@@ -134,8 +141,15 @@ class Llama3Generator:
         optimizations="performance",
         trace_mode: TraceMode = "all",
         device_sampling_enabled: bool = True,
+        kv_cache_dtype=None,
     ):
-        """Build the configured single-lane or data-parallel Llama target."""
+        """Build the configured single-lane or data-parallel Llama target.
+
+        ``kv_cache_dtype`` is the serving engine's KV-cache dtype (vLLM
+        ``--kv-cache-dtype``) as a ttnn dtype, or ``None`` for the precision
+        profile's. The KV dtype is a construction-time model property here, so
+        the engine's choice must arrive now rather than at ``allocate_kv_cache``.
+        """
 
         hf_model = getattr(hf_config, "_name_or_path", None)
         if not hf_model:
@@ -151,12 +165,24 @@ class Llama3Generator:
                 optimizations=optimizations,
                 trace_mode=trace_mode,
                 device_sampling_enabled=device_sampling_enabled,
+                kv_cache_dtype=kv_cache_dtype,
             )
         )
 
-    def allocate_kv_cache(self, kv_cache_shape=None, dtype=None, num_layers=None):
-        """Resolve the late vLLM capacity, then allocate a borrowed cache handle."""
+    def allocate_kv_cache(self, kv_cache_shape=None, dtype=None, num_layers=None, kv_cache_dtype=None):
+        """Resolve the late vLLM capacity, then allocate a borrowed cache handle.
 
+        ``kv_cache_dtype`` (the engine's explicit KV dtype) must equal the dtype
+        the model was constructed with; it cannot change the cache here.
+        """
+
+        if kv_cache_dtype is not None:
+            model_dtypes = set(self._adapter.config.model_kv_cache_dtypes)
+            if model_dtypes != {kv_cache_dtype}:
+                raise ValueError(
+                    f"engine KV cache dtype {kv_cache_dtype!r} differs from the model's "
+                    f"{sorted(map(repr, model_dtypes))}; pass it to initialize_vllm_model"
+                )
         supplied = (kv_cache_shape is not None, dtype is not None, num_layers is not None)
         if not any(supplied):
             return self.target.allocate_kv_cache()
@@ -191,6 +217,7 @@ class Llama3Generator:
             kv_cache=kv_cache,
             sampling_params=sampling_params,
         )
+        self._align_cached_starts(normalized)
         execution = self._select_prefill_execution(normalized, trace_requested)
         return self.target.compile_prefill(execution=execution, **normalized)
 
@@ -245,6 +272,7 @@ class Llama3Generator:
             sampling_params=sampling_params,
             compatibility_kwargs=compatibility_kwargs,
         )
+        self._align_cached_starts(normalized)
         execution = self._select_prefill_execution(normalized, trace_requested)
         return self.target.prefill_forward(execution=execution, **normalized)
 
@@ -307,11 +335,13 @@ class Llama3Generator:
         can_sample_on_device: bool,  # ↓ Execution policy
         enable_trace: bool,
     ) -> None:
-        return self.target.warmup_model_prefill(
+        result = self.target.warmup_model_prefill(
             kv_cache=kv_cache,
             can_sample_on_device=can_sample_on_device,
             enable_trace=enable_trace,
         )
+        self._log_serving_ready_summary_if_active()
+        return result
 
     def warmup_model_decode(
         self,
@@ -322,13 +352,15 @@ class Llama3Generator:
         can_sample_on_device: bool,  # ↓ Execution policy
         enable_trace: bool,
     ) -> None:
-        return self.target.warmup_model_decode(
+        result = self.target.warmup_model_decode(
             kv_cache=kv_cache,
             max_batch_size=max_batch_size,
             num_blocks=num_blocks,
             can_sample_on_device=can_sample_on_device,
             enable_trace=enable_trace,
         )
+        self._log_serving_ready_summary_if_active()
+        return result
 
     def cleanup(self):
         """Release every resource owned by the concrete target."""
@@ -336,6 +368,35 @@ class Llama3Generator:
         return self.target.cleanup()
 
     # Private implementation
+
+    def _log_serving_ready_summary_if_active(self) -> None:
+        """Log trace/program counts once traces are active (as the Llama 3.3 70B generator does)."""
+
+        traced = getattr(self.target, "traced_executor", None)
+        trace_compiler = getattr(traced, "trace_compiler", None)
+        if traced is None or self._serving_ready_summary_logged or not getattr(trace_compiler, "trace_active", False):
+            return
+        traced.log_runtime_summary(phase="serving_ready")
+        self._serving_ready_summary_logged = True
+
+    def _align_cached_starts(self, normalized: NormalizedPrefillKwargs) -> None:
+        """Floor each row's cached start to the KV block size.
+
+        The prefill planner continues only from block-aligned cached starts.
+        vLLM resumes a request whose whole prompt is already cached (a remote
+        KV load, or a full prefix hit) at ``len - 1`` to recompute the last
+        token; flooring recomputes up to ``block_size - 1`` tokens and rewrites
+        their KV, which is what the planner's block-aligned path supports.
+        """
+
+        start_pos = normalized.get("start_pos")
+        if start_pos is None or not bool(start_pos.any()):
+            return
+        config = self.target.paged_kv_cache_config
+        block_size = int((config[0] if isinstance(config, tuple) else config).block_size)
+        aligned = start_pos - start_pos % block_size
+        if not torch.equal(aligned, start_pos):
+            normalized["start_pos"] = aligned
 
     def _select_prefill_execution(
         self,
@@ -388,6 +449,7 @@ def build_llama3_generator(config: Llama3GeneratorConfig) -> Llama3Generator:
                 n_layers=config.n_layers,
                 dtype=ttnn.bfloat8_b,
                 paged_attention_config=paged_attention_config,
+                kv_cache_dtype=config.kv_cache_dtype,
             )
             model_kv_cache_dtypes, _, _, _ = _model_kv_metadata(llm.model)
             executor_config = Llama3ExecutorConfig(

@@ -463,6 +463,7 @@ def from_pretrained(
     dtype=ttnn.bfloat8_b,
     paged_attention_config=None,
     converted_state_dict: dict[str, torch.Tensor] | None = None,
+    kv_cache_dtype=None,
 ):
     """Build a product-level TTTv2 Llama-3.1-8B model from an HF checkpoint."""
     from models.common.models.llama3_8b.model import Llama3Transformer1D, build_llama3_transformer_1d_config
@@ -521,6 +522,7 @@ def from_pretrained(
         weight_cache_path=_weight_cache_path(model_cache_path, instruct=instruct, dtype=dtype),
         dtype=dtype,
         paged_attention_config=paged_attention_config,
+        kv_cache_dtype=kv_cache_dtype,
         pad_logits_to_power_of_2=list(mesh_device.shape) != [1, 1]
         and should_pad_sampling_logits_to_power_of_2(
             nearest_multiple(text_config["vocab_size"], ttnn.TILE_SIZE * mesh_device.get_num_devices()),

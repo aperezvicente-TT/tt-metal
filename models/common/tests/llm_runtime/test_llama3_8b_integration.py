@@ -813,7 +813,9 @@ def test_generator_constructs_model_owned_lane_configs_with_exact_decode_coverag
         n_layers: int | None = None,
         dtype=ttnn.bfloat8_b,
         paged_attention_config=None,
+        kv_cache_dtype=None,
     ):
+        assert kv_cache_dtype is None
         return SimpleNamespace(model=_model(max_batch_size=max_batch_size), runtime_config=_runtime_config())
 
     def fake_build_executor(llm, config):
@@ -1063,3 +1065,139 @@ def test_demo_uses_model_owned_config_and_order_independent_warmup(monkeypatch):
         ("prefill", kv_cache, False, True),
         ("decode", kv_cache, 4, 8, True, True),
     ]
+
+
+def test_initialize_vllm_model_threads_engine_kv_cache_dtype(monkeypatch):
+    captured = []
+    monkeypatch.setattr(llama_generator, "build_llama3_generator", lambda config: captured.append(config))
+    hf_config = SimpleNamespace(_name_or_path="meta-llama/Llama-3.1-8B-Instruct")
+
+    llama_generator.Llama3Generator.initialize_vllm_model(hf_config, object(), 8, 4096)
+    llama_generator.Llama3Generator.initialize_vllm_model(hf_config, object(), 8, 4096, kv_cache_dtype=ttnn.bfloat16)
+
+    assert [config.kv_cache_dtype for config in captured] == [None, ttnn.bfloat16]
+
+
+def test_engine_kv_cache_dtype_reaches_every_lane_model_and_cache_config(monkeypatch):
+    pretrained_kv_dtypes = []
+    executor_configs = []
+    monkeypatch.setattr(llama_generator, "_create_submeshes", lambda mesh, dp: [_Mesh(), _Mesh()])
+
+    def fake_from_pretrained(mesh_device, *, max_batch_size, kv_cache_dtype=None, **_kwargs):
+        pretrained_kv_dtypes.append(kv_cache_dtype)
+        model = _model(max_batch_size=max_batch_size)
+        model.layers[0].attention.config.kv_cache_dtype = kv_cache_dtype
+        return SimpleNamespace(model=model, runtime_config=_runtime_config())
+
+    def fake_build_executor(llm, config):
+        executor_configs.append(config)
+        return _FakeLane(llm, config)
+
+    monkeypatch.setattr(llama_generator, "from_pretrained", fake_from_pretrained)
+    monkeypatch.setattr(llama_generator, "build_llama3_executor", fake_build_executor)
+
+    generator = llama_generator.build_llama3_generator(
+        llama_generator.Llama3GeneratorConfig(
+            hf_model="meta-llama/Llama-3.1-8B-Instruct",
+            mesh_device=object(),
+            max_batch_size=4,
+            max_seq_len=4096,
+            n_layers=1,
+            tt_data_parallel=2,
+            kv_cache_dtype=ttnn.bfloat16,
+        )
+    )
+
+    assert pretrained_kv_dtypes == [ttnn.bfloat16, ttnn.bfloat16]
+    assert [config.paged_kv_cache.dtype for config in executor_configs] == [ttnn.bfloat16, ttnn.bfloat16]
+    assert generator._adapter.config.model_kv_cache_dtypes == (ttnn.bfloat16,)
+
+
+class _AllocTarget:
+    def __init__(self):
+        self.allocations = 0
+
+    def allocate_kv_cache(self):
+        self.allocations += 1
+        return "cache"
+
+
+def test_allocate_accepts_engine_kv_cache_dtype_equal_to_model_dtype(expect_error):
+    target = _AllocTarget()
+    target.model = _model()
+    target.config = _config("all")
+    target._request_state_fields = ()
+    generator = llama_generator.Llama3Generator(target, adapter=llama_generator._build_vllm_adapter(target))
+
+    assert generator.allocate_kv_cache(kv_cache_dtype=ttnn.bfloat8_b) == "cache"
+    with expect_error(ValueError, "pass it to initialize_vllm_model"):
+        generator.allocate_kv_cache(kv_cache_dtype=ttnn.bfloat16)
+    assert target.allocations == 1
+
+
+@pytest.mark.parametrize(
+    ("block_size", "start_pos", "expected"),
+    [
+        (32, [0], [0]),
+        (32, [64], [64]),
+        (32, [100], [96]),
+        (64, [127, 0, 128], [64, 0, 128]),
+    ],
+)
+def test_prefill_floors_cached_starts_to_kv_block(block_size, start_pos, expected):
+    target = _RecordingTarget()
+    generator = _recording_generator(target)
+    target.paged_kv_cache_config = SimpleNamespace(block_size=block_size)
+    rows = len(start_pos)
+    tokens = torch.ones((rows, 256), dtype=torch.long)
+    page_table = torch.zeros((rows, 8), dtype=torch.int32)
+    start = torch.tensor(start_pos, dtype=torch.long)
+    prompt_lens = start + 1
+
+    generator.prefill_forward(tokens, page_table, enable_trace=True, prompt_lens=prompt_lens, start_pos=start)
+
+    (_, _, kwargs) = target.calls[-1]
+    assert kwargs["start_pos"].tolist() == expected
+    assert kwargs["prompt_lens"].tolist() == prompt_lens.tolist()
+    assert start.tolist() == start_pos
+
+
+def test_prefill_floor_uses_lane_group_block_size():
+    target = _RecordingTarget()
+    generator = _recording_generator(target)
+    target.paged_kv_cache_config = (SimpleNamespace(block_size=64), SimpleNamespace(block_size=64))
+    tokens = torch.ones((1, 256), dtype=torch.long)
+    page_table = torch.zeros((1, 8), dtype=torch.int32)
+
+    generator.prefill_forward(
+        tokens, page_table, enable_trace=False, prompt_lens=torch.tensor([200]), start_pos=torch.tensor([199])
+    )
+
+    assert target.calls[-1][2]["start_pos"].tolist() == [192]
+
+
+def test_generator_declares_scheduler_chunked_prefill():
+    assert llama_generator.Llama3Generator.model_capabilities["supports_chunked_prefill"] is True
+
+
+def test_warmup_logs_serving_ready_summary_once_traces_are_active():
+    summaries = []
+    trace_compiler = SimpleNamespace(trace_active=False)
+    traced = SimpleNamespace(
+        trace_compiler=trace_compiler,
+        log_runtime_summary=lambda *, phase: summaries.append(phase),
+    )
+    target = SimpleNamespace(
+        traced_executor=traced,
+        warmup_model_prefill=lambda **kwargs: None,
+        warmup_model_decode=lambda **kwargs: None,
+    )
+    generator = llama_generator.Llama3Generator(target, adapter=None)
+    decode = dict(kv_cache=None, max_batch_size=1, num_blocks=1, can_sample_on_device=False)
+
+    generator.warmup_model_prefill(kv_cache=None, can_sample_on_device=False, enable_trace=False)
+    trace_compiler.trace_active = True
+    generator.warmup_model_decode(enable_trace=True, **decode)
+    generator.warmup_model_decode(enable_trace=True, **decode)
+
+    assert summaries == ["serving_ready"]

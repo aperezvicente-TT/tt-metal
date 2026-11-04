@@ -1010,8 +1010,13 @@ def build_llama3_transformer_1d_config(
     dtype=None,
     paged_attention_config=None,
     pad_logits_to_power_of_2=False,
+    kv_cache_dtype=None,
 ) -> Llama3Transformer1DConfig:
-    """Build explicit TTTv2 module configs from Llama-3.1-8B construction data."""
+    """Build explicit TTTv2 module configs from Llama-3.1-8B construction data.
+
+    ``kv_cache_dtype`` overrides the precision profile's KV-cache dtype for every
+    layer (a serving engine's ``--kv-cache-dtype``); ``None`` keeps the profile.
+    """
     num_devices = mesh_device.get_num_devices()
     dram_grid_size = mesh_device.dram_grid_size()
     device_name = get_device_name(mesh_device)
@@ -1488,7 +1493,7 @@ def build_llama3_transformer_1d_config(
 
         wqkv_dtype = get_tensor_dtype(layer_num, "wqkv")
         wo_dtype = get_tensor_dtype(layer_num, "wo")
-        kv_cache_dtype = get_tensor_dtype(layer_num, "kv_cache")
+        layer_kv_cache_dtype = kv_cache_dtype or get_tensor_dtype(layer_num, "kv_cache")
         activation_dtype = get_tensor_dtype(layer_num, "activation")
 
         qkv_list = []
@@ -1597,7 +1602,7 @@ def build_llama3_transformer_1d_config(
             use_qk_fused=True,
             use_vllm_paged_kv_cache=use_paged_kv_cache,
             paged_attention_config=paged_attention_config,
-            kv_cache_dtype=kv_cache_dtype,
+            kv_cache_dtype=layer_kv_cache_dtype,
             min_kv_prefill_shard_seqlen=min_kv_prefill_shard_seqlen,
             wqkv_dtype=wqkv_dtype,
             wo_dtype=wo_dtype,
