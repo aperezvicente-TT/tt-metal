@@ -99,7 +99,7 @@ private:
     // expose this (num_interrupt_vecs == 0)
     void disable_eth_interrupts(tt::ChipId device_id, const CoreCoord& virtual_core);
 
-    void assert_cores(tt::ChipId device_id);
+    void assert_cores(tt::ChipId device_id, bool reset_eth = true);
     void teardown_simulator_ethernet_cores();
 
     GetControlPlaneFn get_control_plane_;
