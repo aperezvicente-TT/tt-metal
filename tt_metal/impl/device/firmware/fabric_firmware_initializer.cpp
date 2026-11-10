@@ -432,7 +432,14 @@ void FabricFirmwareInitializer::teardown(std::unordered_set<InitializerKey>& ini
 
 void FabricFirmwareInitializer::post_teardown() {
     // Reset fabric config
-    descriptor_->metal_context().set_fabric_config(tt::tt_fabric::FabricConfig::DISABLED);
+    // Keep the fabric manager mode: the firmware teardown that follows keys on it.
+    descriptor_->metal_context().set_fabric_config(
+        tt::tt_fabric::FabricConfig::DISABLED,
+        tt::tt_fabric::FabricReliabilityMode::STRICT_SYSTEM_HEALTH_SETUP_MODE,
+        std::nullopt,
+        tt::tt_fabric::FabricTensixConfig::DISABLED,
+        tt::tt_fabric::FabricUDMMode::DISABLED,
+        descriptor_->fabric_manager());
 }
 
 bool FabricFirmwareInitializer::is_initialized() const { return initialized_.test(); }

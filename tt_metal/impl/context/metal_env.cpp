@@ -629,7 +629,16 @@ void MetalEnvImpl::set_custom_fabric_topology(
     const std::map<tt_fabric::FabricNodeId, ChipId>& logical_mesh_chip_id_to_physical_chip_id_mapping) {
     this->logical_mesh_chip_id_to_physical_chip_id_mapping_ = logical_mesh_chip_id_to_physical_chip_id_mapping;
     custom_mesh_graph_desc_path_ = mesh_graph_desc_file;
-    this->set_fabric_config(fabric_config_, tt::tt_fabric::FabricReliabilityMode::STRICT_SYSTEM_HEALTH_SETUP_MODE);
+    // Re-apply the current configuration, mode included: since a DISABLED call records the mode, a default
+    // argument here would turn a fabric-off ENABLED process back into DEFAULT (which resets the routers).
+    this->set_fabric_config(
+        fabric_config_,
+        tt::tt_fabric::FabricReliabilityMode::STRICT_SYSTEM_HEALTH_SETUP_MODE,
+        std::nullopt,
+        fabric_tensix_config_,
+        fabric_udm_mode_,
+        fabric_manager_,
+        fabric_router_config_);
 }
 
 void MetalEnvImpl::set_default_fabric_topology() {
@@ -642,7 +651,16 @@ void MetalEnvImpl::set_default_fabric_topology() {
     } else {
         custom_mesh_graph_desc_path_ = std::nullopt;
     }
-    this->set_fabric_config(fabric_config_, tt::tt_fabric::FabricReliabilityMode::STRICT_SYSTEM_HEALTH_SETUP_MODE);
+    // Re-apply the current configuration, mode included: since a DISABLED call records the mode, a default
+    // argument here would turn a fabric-off ENABLED process back into DEFAULT (which resets the routers).
+    this->set_fabric_config(
+        fabric_config_,
+        tt::tt_fabric::FabricReliabilityMode::STRICT_SYSTEM_HEALTH_SETUP_MODE,
+        std::nullopt,
+        fabric_tensix_config_,
+        fabric_udm_mode_,
+        fabric_manager_,
+        fabric_router_config_);
 }
 
 // ─── Distributed context ──────────────────────────────────────────────────────
