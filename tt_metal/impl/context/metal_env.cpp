@@ -368,6 +368,9 @@ bool MetalEnvImpl::set_fabric_config(
     }
 
     if (this->fabric_config_ == tt_fabric::FabricConfig::DISABLED) {
+        // A fabric-off process still has to be able to say "the routers are not mine" (ENABLED):
+        // the firmware open and close paths key on it.
+        this->fabric_manager_ = fabric_manager;
         if (num_routing_planes.has_value()) {
             log_warning(
                 tt::LogMetal,
