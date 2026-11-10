@@ -224,8 +224,11 @@ void RiscFirmwareInitializer::run_launch_phase(const std::set<tt::ChipId>& devic
         for (tt::ChipId device_id : device_ids) {
             ClearNocData(descriptor_->env_impl(), device_id);
             // Wait for base FW to finish its eth_init() on all idle ETH cores before
-            // asserting reset (otherwise we could kill it mid-init)
-            for (const auto& eth_core : this->get_control_plane_().get_inactive_ethernet_cores(device_id)) {
+            // asserting reset (otherwise we could kill it mid-init). Without INIT_FABRIC they are not
+            // reset and may run a fabric manager's routers, not base FW.
+            const bool init_eth = has_flag(descriptor_->fabric_manager(), tt_fabric::FabricManagerMode::INIT_FABRIC);
+            for (const auto& eth_core : init_eth ? this->get_control_plane_().get_inactive_ethernet_cores(device_id)
+                                                 : std::unordered_set<CoreCoord>{}) {
                 CoreCoord virtual_core =
                     cluster_.get_virtual_coordinate_from_logical_coordinates(device_id, eth_core, CoreType::ETH);
                 if (!wait_for_eth_fw_ready(device_id, virtual_core)) {
@@ -319,7 +322,8 @@ void RiscFirmwareInitializer::clear_l1_state(tt::ChipId device_id) {
     }
 
     const auto active_eth_cores = this->get_control_plane_().get_active_ethernet_cores(device_id);
-    if (!active_eth_cores.empty()) {
+    if (!active_eth_cores.empty() &&
+        has_flag(descriptor_->fabric_manager(), tt_fabric::FabricManagerMode::INIT_FABRIC)) {
         // Resolved from this context's HAL, once per call (not cached across contexts).
         const uint32_t eth_zero_vec_size =
             hal_.get_dev_size(HalProgrammableCoreType::ACTIVE_ETH, HalL1MemAddrType::UNRESERVED);
@@ -1467,7 +1471,16 @@ void RiscFirmwareInitializer::initialize_and_launch_firmware(tt::ChipId device_i
         }
     }
 
-    for (const auto& eth_core : this->get_control_plane_().get_active_ethernet_cores(device_id)) {
+    // Without INIT_FABRIC this process does not own the Ethernet cores: they may run a fabric
+    // manager's routers (Blackhole ETH firmware is not cooperative, so a running router never
+    // reports RUN_MSG_INIT). Leave active and idle ETH alone: no APP_SYNC_INFO, CORE_INFO, bank
+    // tables or firmware load, and no wait on them.
+    const bool init_eth = has_flag(descriptor_->fabric_manager(), tt_fabric::FabricManagerMode::INIT_FABRIC);
+    const auto active_eth_cores =
+        init_eth ? this->get_control_plane_().get_active_ethernet_cores(device_id) : std::unordered_set<CoreCoord>{};
+    const auto inactive_eth_cores =
+        init_eth ? this->get_control_plane_().get_inactive_ethernet_cores(device_id) : std::unordered_set<CoreCoord>{};
+    for (const auto& eth_core : active_eth_cores) {
         static std::vector<uint32_t> zero_vec_erisc_init(
             hal_.get_dev_size(HalProgrammableCoreType::ACTIVE_ETH, HalL1MemAddrType::APP_SYNC_INFO) / sizeof(uint32_t),
             0);
@@ -1490,7 +1503,7 @@ void RiscFirmwareInitializer::initialize_and_launch_firmware(tt::ChipId device_i
     go_msg.view().signal() = dev_msgs::RUN_MSG_INIT;
 
     std::unordered_set<CoreCoord> multi_risc_active_eth_cores;
-    for (const auto& eth_core : this->get_control_plane_().get_active_ethernet_cores(device_id)) {
+    for (const auto& eth_core : active_eth_cores) {
         CoreCoord virtual_core =
             cluster_.get_virtual_coordinate_from_logical_coordinates(device_id, eth_core, CoreType::ETH);
         core_info.view().absolute_logical_x() = eth_core.x;
@@ -1515,7 +1528,7 @@ void RiscFirmwareInitializer::initialize_and_launch_firmware(tt::ChipId device_i
     launch_msg = dev_msgs_factory.create<dev_msgs::launch_msg_t>();
     go_msg = dev_msgs_factory.create<dev_msgs::go_msg_t>();
     go_msg.view().signal() = dev_msgs::RUN_MSG_INIT;
-    for (const auto& eth_core : this->get_control_plane_().get_inactive_ethernet_cores(device_id)) {
+    for (const auto& eth_core : inactive_eth_cores) {
         CoreCoord virtual_core =
             cluster_.get_virtual_coordinate_from_logical_coordinates(device_id, eth_core, CoreType::ETH);
         core_info.view().absolute_logical_x() = eth_core.x;
