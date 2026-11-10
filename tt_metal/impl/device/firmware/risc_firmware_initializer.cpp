@@ -274,9 +274,12 @@ void RiscFirmwareInitializer::teardown(std::unordered_set<InitializerKey>& /*ini
         // already failed (for example a PCIe MMIO timeout during init), asserting its cores throws
         // again here; log and move on so the process still exits cleanly instead of aborting under
         // a profiler or crash handler and holding the CI step open.
+        // Without TERMINATE_FABRIC the routers belong to whoever brought them up (a fabric manager):
+        // leave every Ethernet core and the routing state alone.
+        const bool reset_eth = has_flag(descriptor_->fabric_manager(), tt_fabric::FabricManagerMode::TERMINATE_FABRIC);
         for (tt::ChipId device_id : all_devices) {
             try {
-                assert_cores(device_id);
+                assert_cores(device_id, reset_eth);
                 cluster_.l1_barrier(device_id);
             } catch (const std::runtime_error& e) {
                 log_warning(
@@ -285,7 +288,7 @@ void RiscFirmwareInitializer::teardown(std::unordered_set<InitializerKey>& /*ini
         }
         // Set internal routing to false to exit active ethernet FW & go back to base FW
         // Must be last
-        if (get_control_plane_) {
+        if (get_control_plane_ && reset_eth) {
             try {
                 cluster_.set_internal_routing_info_for_ethernet_cores(this->get_control_plane_(), false);
             } catch (const std::runtime_error& e) {
@@ -537,12 +540,14 @@ void RiscFirmwareInitializer::reset_cores(tt::ChipId device_id) {
     cluster_.l1_barrier(device_id);
 }
 
-void RiscFirmwareInitializer::assert_cores(tt::ChipId device_id) {
+void RiscFirmwareInitializer::assert_cores(tt::ChipId device_id, bool reset_eth) {
     assert_tensix_workers_impl(device_id);
-    if (!hal_.get_eth_fw_is_cooperative()) {
+    if (reset_eth && !hal_.get_eth_fw_is_cooperative()) {
         assert_active_ethernet_cores_to_reset(device_id);
     }
-    assert_inactive_ethernet_cores(device_id);
+    if (reset_eth) {
+        assert_inactive_ethernet_cores(device_id);
+    }
     assert_dram_cores(device_id);
     assert_dispatch_cores(device_id);
 }
