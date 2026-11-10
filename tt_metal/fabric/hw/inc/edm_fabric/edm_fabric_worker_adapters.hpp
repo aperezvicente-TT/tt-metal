@@ -187,6 +187,46 @@ struct WorkerToFabricEdmSenderBase {
             write_at_cmd_buf);
     }
 
+    // Explicit connection: for a producer with no device-init connection table and no program
+    // semaphores (a process that opened its chip without fabric and was handed the router's
+    // fabric_connection_info_t). Runtime args, in order:
+    //   edm noc x | y << 16, edm_buffer_base_addr, num_buffers_per_channel,
+    //   edm_connection_handshake_addr, edm_worker_location_info_addr, buffer_size_bytes,
+    //   buffer_index_semaphore_id (the router's producer-cursor address),
+    // then L1 addresses on this core: free-slots word, teardown word, producer-cursor landing zone
+    // (16 B aligned, 16 B long). VC0 sender channel only.
+    template <ProgrammableCoreType my_core_type>
+    static WorkerToFabricEdmSenderBase build_from_explicit_args(std::size_t& arg_idx) {
+        static_assert(VC_ID == 0, "explicit connections are for the VC0 worker channel");
+        const uint32_t xy = get_arg_val<uint32_t>(arg_idx++);
+        const uint32_t edm_buffer_base_addr = get_arg_val<uint32_t>(arg_idx++);
+        const uint8_t num_buffers_per_channel = static_cast<uint8_t>(get_arg_val<uint32_t>(arg_idx++));
+        const uint32_t edm_connection_handshake_l1_addr = get_arg_val<uint32_t>(arg_idx++);
+        const uint32_t edm_worker_location_info_addr = get_arg_val<uint32_t>(arg_idx++);
+        const uint16_t buffer_size_bytes = static_cast<uint16_t>(get_arg_val<uint32_t>(arg_idx++));
+        const uint32_t edm_copy_of_wr_counter_addr = get_arg_val<uint32_t>(arg_idx++);
+        auto* writer_send_sem_addr = reinterpret_cast<volatile uint32_t*>(get_arg_val<uint32_t>(arg_idx++));
+        auto* worker_teardown_sem_addr = reinterpret_cast<volatile uint32_t* const>(get_arg_val<uint32_t>(arg_idx++));
+        const uint32_t worker_buffer_index_semaphore_addr = get_arg_val<uint32_t>(arg_idx++);
+        return WorkerToFabricEdmSenderBase(
+            /*connected_to_persistent_fabric=*/true,
+            static_cast<uint8_t>(xy & 0xffff),
+            static_cast<uint8_t>(xy >> 16),
+            edm_buffer_base_addr,
+            num_buffers_per_channel,
+            edm_connection_handshake_l1_addr,
+            edm_worker_location_info_addr,
+            buffer_size_bytes,
+            edm_copy_of_wr_counter_addr,
+            writer_send_sem_addr,
+            worker_teardown_sem_addr,
+            worker_buffer_index_semaphore_addr,
+            STREAM_ID,
+            StreamId{std::numeric_limits<uint32_t>::max()},
+            write_reg_cmd_buf,
+            write_at_cmd_buf);
+    }
+
     template <ProgrammableCoreType my_core_type = ProgrammableCoreType::ACTIVE_ETH>
     FORCE_INLINE void init(
         bool connected_to_persistent_fabric,
