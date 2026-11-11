@@ -405,6 +405,7 @@ def initialize_vllm_text_transformer(
     n_layers=None,
     dtype=ttnn.bfloat8_b,
     optimizations=DecodersPrecision.performance,
+    use_hf_rope=False,
 ):
     submesh_devices = create_submeshes(mesh_device, tt_data_parallel)
     # Load model args, weights
@@ -418,6 +419,7 @@ def initialize_vllm_text_transformer(
             max_batch_size=max_batch_size // tt_data_parallel,
             optimizations=lambda model_args: optimizations(model_args.n_layers, model_args.model_name),
             max_seq_len=max_seq_len,
+            use_hf_rope=use_hf_rope,
         )
 
         assert model_args_i.model_name.replace("-", "") in hf_config._name_or_path.replace(
@@ -720,6 +722,8 @@ class LlamaForCausalLM(Generator):
         # the chunked SDPA, and the generator floors the offset to what that op
         # needs, so a prompt split across engine steps needs no new prefill code.
         "supports_chunked_prefill": True,
+        # initialize_vllm_model takes use_hf_rope: K in the checkpoint's RoPE order.
+        "supports_hf_rope_kv": True,
     }
 
     @classmethod
@@ -757,6 +761,7 @@ class LlamaForCausalLM(Generator):
         n_layers=None,
         tt_data_parallel=1,
         optimizations: str = "performance",
+        use_hf_rope: bool = False,
     ):
         hf_model_name = hf_config._name_or_path
         if (
@@ -784,6 +789,7 @@ class LlamaForCausalLM(Generator):
                 if optimizations is not None
                 else DecodersPrecision.performance
             ),
+            use_hf_rope=use_hf_rope,
         )
         return cls(tt_model, model_args, mesh_device)
 
