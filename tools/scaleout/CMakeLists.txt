@@ -400,3 +400,16 @@ set_target_properties(
         RUNTIME_OUTPUT_DIRECTORY
             ${Metalium_BINARY_DIR}/tools/scaleout
 )
+
+# Fabric island tools: island_up brings routers up and exits leaving them running; island_probe
+# reads router words with raw UMD, without opening the chip.
+add_executable(island_up fabric_manager/island_up.cpp)
+target_include_directories(island_up PRIVATE "$<TARGET_PROPERTY:TT::Metalium,INCLUDE_DIRECTORIES>")
+target_link_libraries(
+    island_up
+    PRIVATE
+        tt_metal
+        enchantum::enchantum
+)
+add_executable(island_probe fabric_manager/island_probe.cpp)
+target_link_libraries(island_probe PRIVATE umd::tt-umd)
